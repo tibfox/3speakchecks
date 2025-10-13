@@ -99,9 +99,47 @@ The API expects documents in the `contentcreators` collection with this structur
 | `DATABASE_NAME` | MongoDB database name | - | Yes |
 | `COLLECTION_NAME` | MongoDB collection name | - | Yes |
 
+## Production Deployment
+
+### Setting up as a System Service
+
+1. **On your production server**, clone and setup:
+```bash
+git clone https://github.com/menobass/3speakbanchecker.git
+cd 3speakbanchecker
+npm install --production
+```
+
+2. **Configure environment**:
+```bash
+cp .env.example .env
+# Edit .env with your production values
+```
+
+3. **Install as systemd service**:
+```bash
+sudo ./setup-service.sh
+```
+
+This will:
+- Install the service to start automatically on boot
+- Configure proper logging via syslog
+- Set security restrictions
+- Start the service immediately
+
+### Service Management Commands
+```bash
+sudo systemctl start checkbanned-api     # Start service
+sudo systemctl stop checkbanned-api      # Stop service
+sudo systemctl restart checkbanned-api   # Restart service
+sudo systemctl status checkbanned-api    # Check status
+sudo journalctl -u checkbanned-api -f    # View live logs
+```
+
 ## Security Notes
 
 - Never commit your `.env` file to version control
 - Use strong authentication credentials for MongoDB
 - Consider using environment variables or secrets management in production
 - Ensure your MongoDB instance is properly secured
+- The systemd service runs with restricted permissions for security

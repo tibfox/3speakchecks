@@ -1,0 +1,29 @@
+[Unit]
+Description=CheckBanned API Service
+After=network.target mongodb.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=threespeak
+Group=threespeak
+WorkingDirectory=/home/threespeak/3speakbanchecker
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=PORT=5000
+
+# Logging
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=checkbanned-api
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/threespeak/3speakbanchecker
+
+[Install]
+WantedBy=multi-user.target
