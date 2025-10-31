@@ -1,10 +1,11 @@
 # CheckBanned API
 
-A simple REST API that checks if users are allowed to make posts based on their permissions stored in a MongoDB database.
+A simple REST API that checks user permissions and retrieves Hive usernames from a MongoDB database.
 
 ## Features
 
-- Simple GET endpoint to check user permissions
+- Check user permissions for posting
+- Retrieve Hive usernames from user IDs
 - Connects to MongoDB to verify user status
 - Environment-based configuration
 - CORS enabled for cross-origin requests
@@ -68,24 +69,66 @@ Checks if a user can make posts based on their `banned` and `canUpload` status.
 - User can post if: `banned = false` AND `canUpload = true`
 - Returns `canPost: false` if user not found or doesn't meet criteria
 
+### Get Hive Username
+```
+GET /gethive/:user_id
+```
+Retrieves the Hive username associated with a user ID by querying the users and hiveaccounts collections.
+
+**Response format:**
+```json
+"meno"
+```
+
+**Logic:**
+- Searches `users` collection for the provided `user_id`
+- Uses the `last_identity` field to find the corresponding Hive account in `hiveaccounts` collection
+- Returns the `account` field (Hive username)
+- Returns `"No user ID found"` if user ID not found or no associated Hive account
+
 ## Example Usage
 
 ```bash
+# Health check
+curl http://localhost:3000
+
 # Check if user "meno" can make posts
 curl http://localhost:3000/check/meno
 
-# Health check
-curl http://localhost:3000
+# Get Hive username for user ID
+curl http://localhost:3000/gethive/48d37d99-34ec-4098-be92-682dbbb93379
 ```
 
 ## Database Schema
 
-The API expects documents in the `contentcreators` collection with this structure:
+The API uses multiple MongoDB collections:
+
+### contentcreators Collection (for /check endpoint)
 ```json
 {
   "username": "meno",
   "banned": false,
   "canUpload": true,
+  // ... other fields
+}
+```
+
+### users Collection (for /gethive endpoint)
+```json
+{
+  "user_id": "48d37d99-34ec-4098-be92-682dbbb93379",
+  "email": "menoecua@gmail.com",
+  "last_identity": ObjectId("612bf9256b1c8555334eec15"),
+  // ... other fields
+}
+```
+
+### hiveaccounts Collection (for /gethive endpoint)
+```json
+{
+  "_id": ObjectId("612bf9256b1c8555334eec15"),
+  "account": "meno",
+  "user_id": ObjectId("612bf8e0c8382759076be696"),
   // ... other fields
 }
 ```
