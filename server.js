@@ -1,5 +1,5 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -35,7 +35,8 @@ app.get('/', (req, res) => {
         message: 'CheckBanned API is running',
         version: '1.0.0',
         endpoints: {
-            check: '/check/:username'
+            check: '/check/:username',
+            gethive: '/gethive/:user_id'
         }
     });
 });
@@ -79,6 +80,53 @@ app.get('/check/:username', async (req, res) => {
             error: 'Internal server error',
             canPost: false 
         });
+    }
+});
+
+// Endpoint to get hive username from user ID
+app.get('/gethive/:user_id', async (req, res) => {
+    try {
+        const { user_id } = req.params;
+        
+        if (!user_id) {
+            return res.status(400).json({ 
+                error: 'User ID is required'
+            });
+        }
+
+        // Step 1: Find user in users collection
+        const usersCollection = db.collection('users');
+        const user = await usersCollection.findOne({ user_id: user_id });
+
+        if (!user) {
+            return res.json('No user ID found');
+        }
+
+        if (!user.last_identity) {
+            return res.json('No user ID found');
+        }
+
+        // Step 2: Find hive account using last_identity
+        const hiveAccountsCollection = db.collection('hiveaccounts');
+        
+        // Make sure we're using the ObjectId correctly
+        let identityId = user.last_identity;
+        if (typeof identityId === 'string') {
+            identityId = new ObjectId(identityId);
+        }
+        
+        const hiveAccount = await hiveAccountsCollection.findOne({ _id: identityId });
+
+        if (!hiveAccount || !hiveAccount.account) {
+            return res.json('No user ID found');
+        }
+
+        // Return just the username
+        res.json(hiveAccount.account);
+
+    } catch (error) {
+        console.error('Error getting hive username:', error);
+        res.status(500).json('No user ID found');
     }
 });
 
