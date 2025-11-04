@@ -1,4 +1,3 @@
-<!-- Use this file to provide workspace-specific custom instructions to Copilot. For more details, visit https://code.visualstudio.com/docs/copilot/copilot-customization#_use-a-githubcopilotinstructionsmd-file -->
 
 # CheckBanned API Project Instructions
 
@@ -12,7 +11,11 @@ This project is a Node.js REST API that checks user permissions in a MongoDB dat
 
 ## Key Features
 - `/check/:username` endpoint to verify if a user can make posts
+- `/gethive/:user_id` endpoint to get Hive username from user ID
+- `/getjobid/:owner/:permlink` endpoint to get video job ID
 - Checks `banned` and `canUpload` fields in the contentcreators collection
+- Queries users and hiveaccounts collections for Hive username lookup
+- Queries videos collection for job ID retrieval
 - Configurable MongoDB connection via environment variables
 - Simple JSON responses
 

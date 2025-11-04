@@ -36,7 +36,8 @@ app.get('/', (req, res) => {
         version: '1.0.0',
         endpoints: {
             check: '/check/:username',
-            gethive: '/gethive/:user_id'
+            gethive: '/gethive/:user_id',
+            getjobid: '/getjobid/:owner/:permlink'
         }
     });
 });
@@ -127,6 +128,51 @@ app.get('/gethive/:user_id', async (req, res) => {
     } catch (error) {
         console.error('Error getting hive username:', error);
         res.status(500).json('No user ID found');
+    }
+});
+
+// Endpoint to get job ID from owner and permlink
+app.get('/getjobid/:owner/:permlink', async (req, res) => {
+    try {
+        const { owner, permlink } = req.params;
+        
+        if (!owner || !permlink) {
+            return res.status(400).json({ 
+                error: 'Owner and permlink are required'
+            });
+        }
+
+        // Query the videos collection
+        const videosCollection = db.collection('videos');
+        const video = await videosCollection.findOne({ 
+            owner: owner, 
+            permlink: permlink 
+        });
+
+        if (!video) {
+            return res.json({ 
+                error: 'Video not found'
+            });
+        }
+
+        if (!video.job_id) {
+            return res.json({ 
+                error: 'Video not found'
+            });
+        }
+
+        // Return job ID with context
+        res.json({ 
+            jobId: video.job_id,
+            owner: owner,
+            permlink: permlink
+        });
+
+    } catch (error) {
+        console.error('Error getting job ID:', error);
+        res.status(500).json({ 
+            error: 'Video not found'
+        });
     }
 });
 

@@ -1,11 +1,12 @@
 # CheckBanned API
 
-A simple REST API that checks user permissions and retrieves Hive usernames from a MongoDB database.
+A simple REST API that checks user permissions, retrieves Hive usernames, and gets video job IDs from a MongoDB database.
 
 ## Features
 
 - Check user permissions for posting
 - Retrieve Hive usernames from user IDs
+- Get video job IDs from owner and permlink
 - Connects to MongoDB to verify user status
 - Environment-based configuration
 - CORS enabled for cross-origin requests
@@ -86,6 +87,26 @@ Retrieves the Hive username associated with a user ID by querying the users and 
 - Returns the `account` field (Hive username)
 - Returns `"No user ID found"` if user ID not found or no associated Hive account
 
+### Get Job ID
+```
+GET /getjobid/:owner/:permlink
+```
+Retrieves the job ID for a video by querying the videos collection with owner and permlink.
+
+**Response format:**
+```json
+{
+  "jobId": "7e1bea23-142d-4b37-a882-676298afd323",
+  "owner": "tovia01",
+  "permlink": "lkgdgnazjd"
+}
+```
+
+**Logic:**
+- Searches `videos` collection for matching `owner` and `permlink`
+- Returns the `job_id` field with context
+- Returns `{"error": "Video not found"}` if video not found or job_id missing
+
 ## Example Usage
 
 ```bash
@@ -97,6 +118,9 @@ curl http://localhost:3000/check/meno
 
 # Get Hive username for user ID
 curl http://localhost:3000/gethive/48d37d99-34ec-4098-be92-682dbbb93379
+
+# Get job ID for a video
+curl http://localhost:3000/getjobid/tovia01/lkgdgnazjd
 ```
 
 ## Database Schema
@@ -129,6 +153,17 @@ The API uses multiple MongoDB collections:
   "_id": ObjectId("612bf9256b1c8555334eec15"),
   "account": "meno",
   "user_id": ObjectId("612bf8e0c8382759076be696"),
+  // ... other fields
+}
+```
+
+### videos Collection (for /getjobid endpoint)
+```json
+{
+  "owner": "tovia01",
+  "permlink": "lkgdgnazjd",
+  "job_id": "7e1bea23-142d-4b37-a882-676298afd323",
+  "title": "testing video upload OPH",
   // ... other fields
 }
 ```
