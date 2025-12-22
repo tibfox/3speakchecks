@@ -29,6 +29,22 @@ async function connectToMongo() {
     }
 }
 
+// View counts cache (5 minute TTL)
+const viewsCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function getCachedViews(key) {
+    const cached = viewsCache.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.views;
+    }
+    return null;
+}
+
+function setCachedViews(key, views) {
+    viewsCache.set(key, { views, timestamp: Date.now() });
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({ 
@@ -37,7 +53,8 @@ app.get('/', (req, res) => {
         endpoints: {
             check: '/check/:username',
             gethive: '/gethive/:user_id',
-            getjobid: '/getjobid/:owner/:permlink'
+            getjobid: '/getjobid/:owner/:permlink',
+            views: 'POST /views'
         }
     });
 });
@@ -172,6 +189,85 @@ app.get('/getjobid/:owner/:permlink', async (req, res) => {
         console.error('Error getting job ID:', error);
         res.status(500).json({ 
             error: 'Video not found'
+        });
+    }
+});
+
+// Endpoint to get batch video view counts
+app.post('/views', async (req, res) => {
+    try {
+        const { videos } = req.body;
+        
+        // Validate request body
+        if (!videos || !Array.isArray(videos)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid request body',
+                message: 'videos array is required'
+            });
+        }
+        
+        // Check array length limit
+        if (videos.length > 50) {
+            return res.status(400).json({
+                success: false,
+                error: 'Too many videos',
+                message: 'Maximum 50 videos per request'
+            });
+        }
+        
+        // Validate each video has required fields
+        for (const video of videos) {
+            if (!video.author || !video.permlink) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Invalid request body',
+                    message: 'Each video must have author and permlink'
+                });
+            }
+        }
+        
+        const results = {};
+        
+        // Fetch all in parallel
+        await Promise.all(
+            videos.map(async ({ author, permlink }) => {
+                const key = `${author}/${permlink}`;
+                
+                // Check cache first
+                const cachedViews = getCachedViews(key);
+                if (cachedViews !== null) {
+                    results[key] = cachedViews;
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(
+                        `https://3speak.tv/apiv2/@${author}/${permlink}`
+                    );
+                    if (response.ok) {
+                        const data = await response.json();
+                        const views = data.views ?? 0;
+                        results[key] = views;
+                        setCachedViews(key, views);
+                    } else {
+                        results[key] = null;
+                    }
+                } catch (err) {
+                    console.error(`Error fetching views for ${key}:`, err.message);
+                    results[key] = null;
+                }
+            })
+        );
+        
+        res.json({ success: true, data: results });
+        
+    } catch (error) {
+        console.error('Error fetching view counts:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            message: 'Failed to fetch view counts'
         });
     }
 });

@@ -107,6 +107,50 @@ Retrieves the job ID for a video by querying the videos collection with owner an
 - Returns the `job_id` field with context
 - Returns `{"error": "Video not found"}` if video not found or job_id missing
 
+### Get Video View Counts
+```
+POST /views
+```
+Fetches view counts for one or more videos in a single batch request.
+
+**Request body:**
+```json
+{
+  "videos": [
+    { "author": "username1", "permlink": "video-permlink-1" },
+    { "author": "username2", "permlink": "video-permlink-2" }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `videos` | array | Yes | Array of video identifiers (1-50 items) |
+| `videos[].author` | string | Yes | Hive username of the video author |
+| `videos[].permlink` | string | Yes | Video permlink |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "data": {
+    "username1/video-permlink-1": 1542,
+    "username2/video-permlink-2": 8923
+  }
+}
+```
+
+**Logic:**
+- Fetches view counts from 3speak.tv API for each video
+- Returns `null` for videos not found
+- Results are cached for 5 minutes to reduce API load
+- Maximum 50 videos per request
+
+**Error responses:**
+- `400` - Invalid request body or missing videos array
+- `400` - Too many videos (max 50)
+- `500` - Internal server error
+
 ## Example Usage
 
 ```bash
@@ -121,6 +165,16 @@ curl http://localhost:3000/gethive/48d37d99-34ec-4098-be92-682dbbb93379
 
 # Get job ID for a video
 curl http://localhost:3000/getjobid/tovia01/lkgdgnazjd
+
+# Get view counts for multiple videos
+curl -X POST http://localhost:3000/views \
+  -H "Content-Type: application/json" \
+  -d '{
+    "videos": [
+      {"author": "theycallmedan", "permlink": "video-1"},
+      {"author": "starkerz", "permlink": "video-2"}
+    ]
+  }'
 ```
 
 ## Database Schema
