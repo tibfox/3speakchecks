@@ -1,7 +1,6 @@
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -9,7 +8,6 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = process.env.DATABASE_NAME || 'threespeak';
 const COLLECTION_NAME = process.env.COLLECTION_NAME || 'contentcreators';
-const JWT_SECRET = process.env.AUTH_JWT_SECRET || process.env.JWT_SECRET || 'your-secret-key';
 
 // Middleware
 app.use(cors());
@@ -47,30 +45,6 @@ function setCachedViews(key, views) {
     viewsCache.set(key, { views, timestamp: Date.now() });
 }
 
-// Authentication middleware
-function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-
-    if (!token) {
-        return res.status(401).json({
-            success: false,
-            error: 'Invalid or missing authentication token'
-        });
-    }
-
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (error) {
-        return res.status(401).json({
-            success: false,
-            error: 'Invalid or missing authentication token'
-        });
-    }
-}
-
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({ 
@@ -81,7 +55,7 @@ app.get('/', (req, res) => {
             gethive: '/gethive/:user_id',
             getjobid: '/getjobid/:owner/:permlink',
             views: 'POST /views',
-            myVideos: 'GET /api/my-videos (authenticated)'
+            myVideos: 'GET /api/my-videos?username={username}'
         }
     });
 });
@@ -220,21 +194,19 @@ app.get('/getjobid/:owner/:permlink', async (req, res) => {
     }
 });
 
-// Endpoint to get authenticated user's videos
-app.get('/api/my-videos', authenticateToken, async (req, res) => {
+// Endpoint to get user's videos
+app.get('/api/my-videos', async (req, res) => {
     try {
         // Extract query parameters
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
         const offset = parseInt(req.query.offset) || 0;
         const statusFilter = req.query.status || 'all';
-
-        // Get authenticated user's username from JWT token
-        const username = req.user.username || req.user.account || req.user.user;
+        const username = req.query.username;
 
         if (!username) {
-            return res.status(401).json({
+            return res.status(400).json({
                 success: false,
-                error: 'Invalid token: username not found'
+                error: 'Username is required'
             });
         }
 
