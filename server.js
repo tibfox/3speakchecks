@@ -222,10 +222,11 @@ app.get('/api/my-videos', async (req, res) => {
         // Get total count
         const total = await videosCollection.countDocuments(query);
 
-        // Fetch videos with pagination, sorted by created_at descending, then by _id
+        // Fetch videos with pagination, sorted by _id descending (newest first)
+        // Using _id because it contains timestamp information and is more reliable than created_at
         const videosData = await videosCollection
             .find(query)
-            .sort({ created_at: -1, _id: -1 })
+            .sort({ _id: -1 })
             .skip(offset)
             .limit(limit)
             .toArray();
