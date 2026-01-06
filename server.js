@@ -1,6 +1,7 @@
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -8,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = process.env.DATABASE_NAME || 'threespeak';
 const COLLECTION_NAME = process.env.COLLECTION_NAME || 'contentcreators';
+const JWT_SECRET = process.env.AUTH_JWT_SECRET || process.env.JWT_SECRET || 'your-secret-key';
 
 // Middleware
 app.use(cors());
@@ -45,6 +47,30 @@ function setCachedViews(key, views) {
     viewsCache.set(key, { views, timestamp: Date.now() });
 }
 
+// Authentication middleware
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+    if (!token) {
+        return res.status(401).json({
+            success: false,
+            error: 'Invalid or missing authentication token'
+        });
+    }
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({
+            success: false,
+            error: 'Invalid or missing authentication token'
+        });
+    }
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({ 
@@ -54,7 +80,8 @@ app.get('/', (req, res) => {
             check: '/check/:username',
             gethive: '/gethive/:user_id',
             getjobid: '/getjobid/:owner/:permlink',
-            views: 'POST /views'
+            views: 'POST /views',
+            myVideos: 'GET /api/my-videos (authenticated)'
         }
     });
 });
@@ -189,6 +216,94 @@ app.get('/getjobid/:owner/:permlink', async (req, res) => {
         console.error('Error getting job ID:', error);
         res.status(500).json({ 
             error: 'Video not found'
+        });
+    }
+});
+
+// Endpoint to get authenticated user's videos
+app.get('/api/my-videos', authenticateToken, async (req, res) => {
+    try {
+        // Extract query parameters
+        const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+        const offset = parseInt(req.query.offset) || 0;
+        const statusFilter = req.query.status || 'all';
+
+        // Get authenticated user's username from JWT token
+        const username = req.user.username || req.user.account || req.user.user;
+
+        if (!username) {
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid token: username not found'
+            });
+        }
+
+        // Build query for videos collection
+        const videosCollection = db.collection('videos');
+        const query = { owner: username };
+
+        // Add status filter if not 'all'
+        if (statusFilter !== 'all') {
+            query.status = statusFilter;
+        }
+
+        // Get total count
+        const total = await videosCollection.countDocuments(query);
+
+        // Fetch videos with pagination, sorted by created_at descending
+        const videosData = await videosCollection
+            .find(query)
+            .sort({ created_at: -1 })
+            .skip(offset)
+            .limit(limit)
+            .toArray();
+
+        // Transform videos to match required frontend format
+        const videos = videosData.map(video => {
+            // Determine video_v2 identifier
+            const videoId = video.permlink || video.video_id || video._id?.toString();
+
+            return {
+                video_id: videoId,
+                owner: video.owner,
+                author: video.author || video.owner,
+                permlink: video.permlink || videoId,
+                title: video.title || '',
+                body: video.body || video.description || '',
+                status: video.status || 'draft',
+                publish_type: video.publish_type || (video.status === 'scheduled' ? 'schedule' : 'immediate'),
+                publish_data: video.publish_data || (video.scheduled_at ? { scheduled_at: video.scheduled_at } : null),
+                created_at: video.created_at || video.createdAt || new Date().toISOString(),
+                updated_at: video.updated_at || video.updatedAt || video.created_at || new Date().toISOString(),
+                duration: video.duration || video.spkvideo?.duration || 0,
+                tags: video.tags || [],
+                images: {
+                    thumbnail: video.thumbnail || video.images?.thumbnail || `https://img.3speak.tv/${videoId}/thumbnail.png`,
+                    poster: video.poster || video.images?.poster || `https://img.3speak.tv/${videoId}/poster.jpg`
+                },
+                spkvideo: {
+                    duration: video.duration || video.spkvideo?.duration || 0,
+                    video_v2: videoId
+                }
+            };
+        });
+
+        // Return response
+        res.json({
+            success: true,
+            data: {
+                total,
+                limit,
+                offset,
+                videos
+            }
+        });
+
+    } catch (error) {
+        console.error('Error fetching user videos:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch videos'
         });
     }
 });
