@@ -222,11 +222,10 @@ app.get('/api/my-videos', async (req, res) => {
         // Get total count
         const total = await videosCollection.countDocuments(query);
 
-        // Fetch videos with pagination, sorted by _id descending (newest first)
-        // Using _id because it contains timestamp information and is more reliable than created_at
+        // Fetch videos with pagination, sorted by created descending (newest first)
         const videosData = await videosCollection
             .find(query)
-            .sort({ _id: -1 })
+            .sort({ created: -1, _id: -1 })
             .skip(offset)
             .limit(limit)
             .toArray();
@@ -246,8 +245,8 @@ app.get('/api/my-videos', async (req, res) => {
                 status: video.status || 'draft',
                 publish_type: video.publish_type || (video.status === 'scheduled' ? 'schedule' : 'immediate'),
                 publish_data: video.publish_data || (video.scheduled_at ? { scheduled_at: video.scheduled_at } : null),
-                created_at: video.created_at || video.createdAt || new Date().toISOString(),
-                updated_at: video.updated_at || video.updatedAt || video.created_at || new Date().toISOString(),
+                created_at: video.created || video.created_at || video.createdAt || new Date().toISOString(),
+                updated_at: video.updated_at || video.updatedAt || video.created || new Date().toISOString(),
                 duration: video.duration || video.spkvideo?.duration || 0,
                 tags: video.tags || [],
                 images: {
