@@ -162,6 +162,63 @@ curl http://localhost:3000/videos/tag/hive?page=2&limit=50
 curl http://localhost:3000/videos/tag/devlog?page=1&limit=10
 ```
 
+### Get Personalized Video Feed
+```
+GET /feed/:username?page={page}&limit={limit}
+```
+Retrieves a personalized video feed showing recent videos from accounts that the specified user follows on Hive.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number for pagination (minimum: 1) |
+| `limit` | number | 20 | Results per page (minimum: 1, maximum: 100) |
+
+**Response format:**
+```json
+{
+  "username": "meno",
+  "feedType": "personalized",
+  "following": 378,
+  "page": 1,
+  "limit": 20,
+  "total": 11546,
+  "totalPages": 578,
+  "videos": [
+    {
+      "_id": "6965bacac4cd0d57d080b420",
+      "owner": "shiftrox",
+      "permlink": "f9580320",
+      "title": "Video Title",
+      "created": "2026-01-14T12:05:00.000Z",
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Fetches the user's following list from Hive blockchain API (up to 1000 accounts)
+- Following list is cached for 10 minutes to improve performance
+- Filters videos to only show content from followed accounts
+- Results are sorted by `created` field in descending order (newest first)
+- Returns paginated results with metadata
+- **Fallback behavior**: If the following list cannot be fetched or is empty, returns all videos instead (feedType will be "all")
+- Console logs are generated when fallback occurs or API errors happen
+
+**Example usage:**
+```bash
+# Get first 20 videos from accounts meno follows
+curl http://localhost:3000/feed/meno
+
+# Get page 2 with 50 results
+curl "http://localhost:3000/feed/meno?page=2&limit=50"
+
+# Get first 10 videos from another user's feed
+curl "http://localhost:3000/feed/theycallmedan?limit=10"
+```
+
 ### Get Video View Counts
 ```
 POST /views
@@ -226,6 +283,12 @@ curl http://localhost:3000/videos/tag/hive
 
 # Get videos by tag with pagination
 curl "http://localhost:3000/videos/tag/hive?page=2&limit=50"
+
+# Get personalized feed for a user
+curl http://localhost:3000/feed/meno
+
+# Get personalized feed with pagination
+curl "http://localhost:3000/feed/meno?page=2&limit=50"
 
 # Get view counts for multiple videos
 curl -X POST http://localhost:3000/views \

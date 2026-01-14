@@ -45,6 +45,61 @@ function setCachedViews(key, views) {
     viewsCache.set(key, { views, timestamp: Date.now() });
 }
 
+// Following list cache (10 minute TTL)
+const followingCache = new Map();
+const FOLLOWING_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+function getCachedFollowing(username) {
+    const cached = followingCache.get(username);
+    if (cached && Date.now() - cached.timestamp < FOLLOWING_CACHE_TTL) {
+        return cached.following;
+    }
+    return null;
+}
+
+function setCachedFollowing(username, following) {
+    followingCache.set(username, { following, timestamp: Date.now() });
+}
+
+// Fetch following list from Hive API
+async function getFollowingList(username) {
+    // Check cache first
+    const cached = getCachedFollowing(username);
+    if (cached !== null) {
+        return cached;
+    }
+
+    try {
+        const response = await fetch(
+            `https://api.syncad.com/hafsql/accounts/${username}/following?limit=1000`,
+            { 
+                headers: { 'accept': 'application/json' },
+                timeout: 5000 // 5 second timeout
+            }
+        );
+
+        if (!response.ok) {
+            console.warn(`Failed to fetch following list for ${username}: ${response.status}`);
+            return null;
+        }
+
+        const following = await response.json();
+        
+        if (!Array.isArray(following) || following.length === 0) {
+            console.log(`User ${username} follows nobody or following list is empty`);
+            return null;
+        }
+
+        // Cache the result
+        setCachedFollowing(username, following);
+        return following;
+
+    } catch (error) {
+        console.error(`Error fetching following list for ${username}:`, error.message);
+        return null;
+    }
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({ 
@@ -56,7 +111,8 @@ app.get('/', (req, res) => {
             getjobid: '/getjobid/:owner/:permlink',
             views: 'POST /views',
             myVideos: 'GET /api/my-videos?username={username}',
-            videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}'
+            videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}',
+            feed: 'GET /feed/:username?page={page}&limit={limit}'
         }
     });
 });
@@ -329,6 +385,71 @@ app.get('/videos/tag/:tag', async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching videos by tag:', error);
+        res.status(500).json({ 
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get personalized feed based on following list
+app.get('/feed/:username', async (req, res) => {
+    try {
+        const { username } = req.params;
+        
+        if (!username) {
+            return res.status(400).json({ 
+                error: 'Username is required'
+            });
+        }
+
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        // Get following list from Hive API
+        const followingList = await getFollowingList(username);
+        
+        const videosCollection = db.collection('videos');
+        let query = {};
+        let feedType = 'personalized';
+
+        // If following list exists and has users, filter by them
+        if (followingList && followingList.length > 0) {
+            query = { owner: { $in: followingList } };
+            console.log(`Fetching feed for ${username}: ${followingList.length} following`);
+        } else {
+            // Fallback: return all videos
+            console.log(`Feed fallback for ${username}: showing all videos (no following list)`);
+            feedType = 'all';
+        }
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending (newest first)
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            username: username,
+            feedType: feedType,
+            following: followingList ? followingList.length : 0,
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching feed:', error);
         res.status(500).json({ 
             error: 'Internal server error'
         });
