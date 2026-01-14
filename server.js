@@ -55,7 +55,8 @@ app.get('/', (req, res) => {
             gethive: '/gethive/:user_id',
             getjobid: '/getjobid/:owner/:permlink',
             views: 'POST /views',
-            myVideos: 'GET /api/my-videos?username={username}'
+            myVideos: 'GET /api/my-videos?username={username}',
+            videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}'
         }
     });
 });
@@ -276,6 +277,60 @@ app.get('/api/my-videos', async (req, res) => {
         res.status(500).json({
             success: false,
             error: 'Failed to fetch videos'
+        });
+    }
+});
+
+// Endpoint to get videos by tag
+app.get('/videos/tag/:tag', async (req, res) => {
+    try {
+        const { tag } = req.params;
+        
+        if (!tag) {
+            return res.status(400).json({ 
+                error: 'Tag is required'
+            });
+        }
+
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        // Query the videos collection
+        const videosCollection = db.collection('videos');
+        
+        // Build query to find videos with the tag in tags_v2 array
+        const query = { 
+            tags_v2: tag.toLowerCase()
+        };
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending (newest first)
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            tag: tag,
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching videos by tag:', error);
+        res.status(500).json({ 
+            error: 'Internal server error'
         });
     }
 });

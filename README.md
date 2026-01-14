@@ -1,13 +1,15 @@
 # CheckBanned API
 
-A simple REST API that checks user permissions, retrieves Hive usernames, and gets video job IDs from a MongoDB database.
+A comprehensive REST API for managing and retrieving 3Speak video data, user permissions, and Hive account information from MongoDB.
 
 ## Features
 
-- Check user permissions for posting
+- Check user permissions and upload eligibility
 - Retrieve Hive usernames from user IDs
 - Get video job IDs from owner and permlink
-- Connects to MongoDB to verify user status
+- Fetch user's video library with pagination and filtering
+- Search videos by tag with pagination (newest first)
+- Batch fetch video view counts with caching
 - Environment-based configuration
 - CORS enabled for cross-origin requests
 - Health check endpoint
@@ -107,6 +109,59 @@ Retrieves the job ID for a video by querying the videos collection with owner an
 - Returns the `job_id` field with context
 - Returns `{"error": "Video not found"}` if video not found or job_id missing
 
+### Get Videos by Tag
+```
+GET /videos/tag/:tag?page={page}&limit={limit}
+```
+Retrieves all videos containing a specific tag, sorted by creation date (newest first).
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number for pagination (minimum: 1) |
+| `limit` | number | 20 | Results per page (minimum: 1, maximum: 100) |
+
+**Response format:**
+```json
+{
+  "tag": "hive",
+  "page": 1,
+  "limit": 20,
+  "total": 156,
+  "totalPages": 8,
+  "videos": [
+    {
+      "_id": "696717c8c4cd0d57d080e0ed",
+      "owner": "meno",
+      "permlink": "1b463a9e",
+      "title": "Video Title",
+      "tags_v2": ["hive", "threespeak", "devlog"],
+      "created": "2026-01-14T04:12:57.275Z",
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Searches `videos` collection for the tag in the `tags_v2` array field
+- Tag matching is case-insensitive
+- Results are sorted by `created` field in descending order (newest first)
+- Returns paginated results with metadata
+
+**Example usage:**
+```bash
+# Get first 20 videos with tag "hive"
+curl http://localhost:3000/videos/tag/hive
+
+# Get page 2 with 50 results
+curl http://localhost:3000/videos/tag/hive?page=2&limit=50
+
+# Get first 10 videos with tag "devlog"
+curl http://localhost:3000/videos/tag/devlog?page=1&limit=10
+```
+
 ### Get Video View Counts
 ```
 POST /views
@@ -166,6 +221,12 @@ curl http://localhost:3000/gethive/48d37d99-34ec-4098-be92-682dbbb93379
 # Get job ID for a video
 curl http://localhost:3000/getjobid/tovia01/lkgdgnazjd
 
+# Get videos by tag (first page, 20 results)
+curl http://localhost:3000/videos/tag/hive
+
+# Get videos by tag with pagination
+curl "http://localhost:3000/videos/tag/hive?page=2&limit=50"
+
 # Get view counts for multiple videos
 curl -X POST http://localhost:3000/views \
   -H "Content-Type: application/json" \
@@ -211,15 +272,24 @@ The API uses multiple MongoDB collections:
 }
 ```
 
-### videos Collection (for /getjobid endpoint)
+### videos Collection (for /getjobid and /videos/tag endpoints)
 ```json
 {
   "owner": "tovia01",
   "permlink": "lkgdgnazjd",
   "job_id": "7e1bea23-142d-4b37-a882-676298afd323",
   "title": "testing video upload OPH",
+  "tags": "hive,hiveproject,threespeak,devlog,pob",
+  "tags_v2": ["hive", "hiveproject", "threespeak", "devlog", "pob"],
+  "created": "2026-01-14T04:12:57.275Z",
   // ... other fields
 }
+```
+
+**Recommended Index for Performance:**
+```javascript
+// For optimal performance of /videos/tag endpoint
+db.videos.createIndex({ tags_v2: 1, created: -1 })
 ```
 
 ## Environment Variables
