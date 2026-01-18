@@ -491,8 +491,9 @@ app.post('/views', async (req, res) => {
         }
         
         const results = {};
+        const videosCollection = db.collection('videos');
         
-        // Fetch all in parallel
+        // Fetch all in parallel from MongoDB
         await Promise.all(
             videos.map(async ({ author, permlink }) => {
                 const key = `${author}/${permlink}`;
@@ -505,12 +506,14 @@ app.post('/views', async (req, res) => {
                 }
                 
                 try {
-                    const response = await fetch(
-                        `https://3speak.tv/apiv2/@${author}/${permlink}`
+                    // Query MongoDB directly for view count
+                    const video = await videosCollection.findOne(
+                        { owner: author, permlink: permlink },
+                        { projection: { views: 1 } }
                     );
-                    if (response.ok) {
-                        const data = await response.json();
-                        const views = data.views ?? 0;
+                    
+                    if (video) {
+                        const views = video.views ?? 0;
                         results[key] = views;
                         setCachedViews(key, views);
                     } else {
