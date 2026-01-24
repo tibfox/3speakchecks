@@ -14,8 +14,11 @@ async function createIndexes() {
         
         const db = client.db(DATABASE_NAME);
         const videosCollection = db.collection('videos');
+        const embedVideoCollection = db.collection('embed-video');
         
         console.log('Creating indexes for performance optimization...\n');
+        
+        console.log('=== VIDEOS COLLECTION ===\n');
         
         // Index for owner filtering and created sorting (for feed endpoint)
         console.log('Creating index: { owner: 1, created: -1 }');
@@ -53,6 +56,48 @@ async function createIndexes() {
         console.log('\nAll indexes on videos collection:');
         const indexes = await videosCollection.indexes();
         indexes.forEach(index => {
+            console.log(`  - ${index.name}: ${JSON.stringify(index.key)}`);
+        });
+        
+        // === EMBED-VIDEO COLLECTION INDEXES ===
+        console.log('\n\n=== EMBED-VIDEO COLLECTION ===\n');
+        
+        // Index for shorts: short + status + createdAt (for /shorts endpoint)
+        console.log('Creating index: { short: 1, status: 1, createdAt: -1 }');
+        try {
+            await embedVideoCollection.createIndex(
+                { short: 1, status: 1, createdAt: -1 },
+                { name: 'short_status_createdAt_desc', background: true }
+            );
+            console.log('✓ Index created: short_status_createdAt_desc');
+        } catch (error) {
+            if (error.code === 85 || error.codeName === 'IndexOptionsConflict') {
+                console.log('✓ Index already exists: short_status_createdAt_desc');
+            } else {
+                throw error;
+            }
+        }
+        
+        // Index for shorts with app filter: short + status + frontend_app + createdAt
+        console.log('\nCreating index: { short: 1, status: 1, frontend_app: 1, createdAt: -1 }');
+        try {
+            await embedVideoCollection.createIndex(
+                { short: 1, status: 1, frontend_app: 1, createdAt: -1 },
+                { name: 'short_status_app_createdAt_desc', background: true }
+            );
+            console.log('✓ Index created: short_status_app_createdAt_desc');
+        } catch (error) {
+            if (error.code === 85 || error.codeName === 'IndexOptionsConflict') {
+                console.log('✓ Index already exists: short_status_app_createdAt_desc');
+            } else {
+                throw error;
+            }
+        }
+        
+        // List all indexes on embed-video
+        console.log('\nAll indexes on embed-video collection:');
+        const embedIndexes = await embedVideoCollection.indexes();
+        embedIndexes.forEach(index => {
             console.log(`  - ${index.name}: ${JSON.stringify(index.key)}`);
         });
         

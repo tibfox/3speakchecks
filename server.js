@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = process.env.DATABASE_NAME || 'threespeak';
 const COLLECTION_NAME = process.env.COLLECTION_NAME || 'contentcreators';
+const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
 // Middleware
 app.use(cors());
@@ -15,6 +16,45 @@ app.use(express.json());
 
 // MongoDB client
 let db;
+
+/**
+ * Middleware to validate API key for protected endpoints
+ * Expects API key in Authorization header: 'Bearer YOUR_API_KEY'
+ */
+function validateApiKey(req, res, next) {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized',
+            message: 'API key is required'
+        });
+    }
+    
+    // Expected format: "Bearer YOUR_API_KEY"
+    const parts = authHeader.split(' ');
+    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized',
+            message: 'Invalid authorization format. Use: Bearer YOUR_API_KEY'
+        });
+    }
+    
+    const providedKey = parts[1];
+    
+    if (providedKey !== API_SECRET_KEY) {
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized',
+            message: 'Invalid API key'
+        });
+    }
+    
+    // API key is valid, proceed to the route handler
+    next();
+}
 
 // Connect to MongoDB
 async function connectToMongo() {
@@ -104,7 +144,7 @@ async function getFollowingList(username) {
 app.get('/', (req, res) => {
     res.json({ 
         message: 'CheckBanned API is running',
-        version: '1.0.0',
+        version: '1.2.0',
         endpoints: {
             check: '/check/:username',
             gethive: '/gethive/:user_id',
@@ -112,7 +152,9 @@ app.get('/', (req, res) => {
             views: 'POST /views',
             myVideos: 'GET /api/my-videos?username={username}',
             videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}',
-            feed: 'GET /feed/:username?page={page}&limit={limit}'
+            feed: 'GET /feed/:username?page={page}&limit={limit}',
+            shorts: 'GET /shorts?page={page}&limit={limit}&app={frontend_app}',
+            updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)'
         }
     });
 });
@@ -456,6 +498,86 @@ app.get('/feed/:username', async (req, res) => {
     }
 });
 
+// Endpoint to get shorts feed
+app.get('/shorts', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+        const appFilter = req.query.app; // optional frontend_app filter
+
+        // Query the embed-video collection
+        const embedVideoCollection = db.collection('embed-video');
+        
+        // Build query for published shorts
+        const query = { 
+            short: true,
+            status: 'published'
+        };
+
+        // Add optional app filter
+        if (appFilter) {
+            query.frontend_app = appFilter;
+            console.log(`Fetching shorts for app: ${appFilter}`);
+        }
+
+        // Get total count for pagination
+        const total = await embedVideoCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch shorts with pagination, sorted by createdAt descending (newest first)
+        const shortsData = await embedVideoCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Get view counts with caching
+        const shorts = await Promise.all(
+            shortsData.map(async (short) => {
+                const key = `${short.owner}/${short.permlink}`;
+                
+                // Check cache first
+                let views = getCachedViews(key);
+                
+                // If not cached, use the views from the document and cache it
+                if (views === null) {
+                    views = short.views ?? 0;
+                    setCachedViews(key, views);
+                }
+
+                return {
+                    owner: short.owner,
+                    permlink: short.permlink,
+                    frontend_app: short.frontend_app,
+                    views: views,
+                    createdAt: short.createdAt
+                };
+            })
+        );
+
+        // Return response
+        res.json({
+            success: true,
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            app: appFilter || 'all',
+            shorts: shorts
+        });
+
+    } catch (error) {
+        console.error('Error fetching shorts:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
 // Endpoint to get batch video view counts
 app.post('/views', async (req, res) => {
     try {
@@ -534,6 +656,103 @@ app.post('/views', async (req, res) => {
             success: false,
             error: 'Internal server error',
             message: 'Failed to fetch view counts'
+        });
+    }
+});
+
+/**
+ * Protected endpoint to update video thumbnail
+ * Requires API key authentication via Authorization header
+ * 
+ * Request body:
+ * {
+ *   "owner": "username",
+ *   "permlink": "video-permlink",
+ *   "thumbnail": "ipfs://QmXXXXXX" or "https://example.com/image.jpg"
+ * }
+ */
+app.put('/video/thumbnail', validateApiKey, async (req, res) => {
+    try {
+        const { owner, permlink, thumbnail } = req.body;
+        
+        // Validate required fields
+        if (!owner || !permlink || !thumbnail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid request',
+                message: 'owner, permlink, and thumbnail are required'
+            });
+        }
+        
+        // Validate thumbnail format (basic validation)
+        const isValidThumbnail = 
+            thumbnail.startsWith('ipfs://') || 
+            thumbnail.startsWith('http://') || 
+            thumbnail.startsWith('https://');
+        
+        if (!isValidThumbnail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid thumbnail',
+                message: 'Thumbnail must be a valid URL or IPFS CID (starting with ipfs://, http://, or https://)'
+            });
+        }
+        
+        // Query the videos collection
+        const videosCollection = db.collection('videos');
+        const video = await videosCollection.findOne({ 
+            owner: owner, 
+            permlink: permlink 
+        });
+        
+        if (!video) {
+            return res.status(404).json({
+                success: false,
+                error: 'Video not found',
+                message: `No video found for owner: ${owner}, permlink: ${permlink}`
+            });
+        }
+        
+        // Update the thumbnail
+        const result = await videosCollection.updateOne(
+            { owner: owner, permlink: permlink },
+            { 
+                $set: { 
+                    thumbnail: thumbnail,
+                    thumbnail_updated_at: new Date()
+                } 
+            }
+        );
+        
+        if (result.modifiedCount === 0) {
+            return res.status(500).json({
+                success: false,
+                error: 'Update failed',
+                message: 'Video found but thumbnail was not updated'
+            });
+        }
+        
+        // Log the update for audit purposes
+        console.log(`Thumbnail updated for ${owner}/${permlink} to: ${thumbnail}`);
+        
+        // Return success response
+        res.json({
+            success: true,
+            message: 'Thumbnail updated successfully',
+            data: {
+                owner: owner,
+                permlink: permlink,
+                thumbnail: thumbnail,
+                updated_at: new Date().toISOString()
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error updating thumbnail:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            message: 'Failed to update thumbnail'
         });
     }
 });

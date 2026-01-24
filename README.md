@@ -9,7 +9,10 @@ A comprehensive REST API for managing and retrieving 3Speak video data, user per
 - Get video job IDs from owner and permlink
 - Fetch user's video library with pagination and filtering
 - Search videos by tag with pagination (newest first)
+- Get personalized video feeds based on Hive following list
+- Get shorts feed with optional app filtering
 - Batch fetch video view counts with caching
+- Update video thumbnails (protected endpoint)
 - Environment-based configuration
 - CORS enabled for cross-origin requests
 - Health check endpoint
@@ -34,6 +37,7 @@ Required environment variables:
 - `MONGODB_URI` - Your MongoDB connection string
 - `DATABASE_NAME` - Your MongoDB database name
 - `COLLECTION_NAME` - Your MongoDB collection name
+- `API_SECRET_KEY` - Secret key for protected endpoints (thumbnail updates)
 
 3. Start the server:
 ```bash
@@ -219,6 +223,64 @@ curl "http://localhost:3000/feed/meno?page=2&limit=50"
 curl "http://localhost:3000/feed/theycallmedan?limit=10"
 ```
 
+### Get Shorts Feed
+```
+GET /shorts?page={page}&limit={limit}&app={frontend_app}
+```
+Retrieves a feed of published short-form videos from the embed-video collection, sorted by newest first.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number for pagination (minimum: 1) |
+| `limit` | number | 20 | Results per page (minimum: 1, maximum: 100) |
+| `app` | string | all | Optional filter by frontend_app (e.g., "snapie", "threespeak") |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "page": 1,
+  "limit": 20,
+  "total": 150,
+  "totalPages": 8,
+  "app": "all",
+  "shorts": [
+    {
+      "owner": "ismeris",
+      "permlink": "dyprlkq4",
+      "frontend_app": "snapie",
+      "views": 5,
+      "createdAt": "2026-01-24T18:14:29.649Z"
+    }
+  ]
+}
+```
+
+**Logic:**
+- Fetches from `embed-video` collection with filters: `short: true` and `status: "published"`
+- Optional filtering by `frontend_app` for app-specific feeds
+- Results are sorted by `createdAt` field in descending order (newest first)
+- View counts are cached for 5 minutes to improve performance
+- Returns paginated results with metadata
+- Frontend apps use the `frontend_app` field to display "created with" overlays
+
+**Example usage:**
+```bash
+# Get all published shorts
+curl http://localhost:3000/shorts
+
+# Get page 2 with 50 results
+curl "http://localhost:3000/shorts?page=2&limit=50"
+
+# Get only Snapie shorts
+curl "http://localhost:3000/shorts?app=snapie"
+
+# Get only 3Speak shorts
+curl "http://localhost:3000/shorts?app=threespeak"
+```
+
 ### Get Video View Counts
 ```
 POST /views
@@ -263,6 +325,83 @@ Fetches view counts for one or more videos in a single batch request.
 - `400` - Too many videos (max 50)
 - `500` - Internal server error
 
+### Update Video Thumbnail (Protected)
+```
+PUT /video/thumbnail
+```
+Updates the thumbnail URL for a specific video. This endpoint is protected and requires API key authentication.
+
+**Authentication:**
+Requires API key in Authorization header:
+```
+Authorization: Bearer YOUR_API_SECRET_KEY
+```
+
+**Request body:**
+```json
+{
+  "owner": "mantequilla-soft",
+  "permlink": "fd9ef87a",
+  "thumbnail": "ipfs://QmNewThumbnailCID"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `owner` | string | Yes | Hive username of the video owner |
+| `permlink` | string | Yes | Video permlink |
+| `thumbnail` | string | Yes | New thumbnail URL (must start with ipfs://, http://, or https://) |
+
+**Response format (success):**
+```json
+{
+  "success": true,
+  "message": "Thumbnail updated successfully",
+  "data": {
+    "owner": "mantequilla-soft",
+    "permlink": "fd9ef87a",
+    "thumbnail": "ipfs://QmNewThumbnailCID",
+    "updated_at": "2026-01-24T20:30:00.000Z"
+  }
+}
+```
+
+**Logic:**
+- Validates API key before processing request
+- Validates thumbnail URL format (must be IPFS CID or HTTP/HTTPS URL)
+- Checks if video exists in the `videos` collection
+- Updates thumbnail and adds `thumbnail_updated_at` timestamp
+- Logs all updates for audit purposes
+
+**Error responses:**
+- `401` - Unauthorized (missing or invalid API key)
+- `400` - Invalid request (missing fields or invalid thumbnail format)
+- `404` - Video not found
+- `500` - Internal server error
+
+**Example usage:**
+```bash
+# Update video thumbnail
+curl -X PUT http://localhost:3000/video/thumbnail \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  -d '{
+    "owner": "meno",
+    "permlink": "abc123",
+    "thumbnail": "ipfs://QmNewThumbnailCID"
+  }'
+
+# Update with full URL
+curl -X PUT http://localhost:3000/video/thumbnail \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  -d '{
+    "owner": "meno",
+    "permlink": "abc123",
+    "thumbnail": "https://example.com/new-thumbnail.jpg"
+  }'
+```
+
 ## Example Usage
 
 ```bash
@@ -289,6 +428,22 @@ curl http://localhost:3000/feed/meno
 
 # Get personalized feed with pagination
 curl "http://localhost:3000/feed/meno?page=2&limit=50"
+
+# Get shorts feed (all apps)
+curl http://localhost:3000/shorts
+
+# Get shorts feed with pagination and app filter
+curl "http://localhost:3000/shorts?page=1&limit=20&app=snapie"
+
+# Update video thumbnail (protected endpoint)
+curl -X PUT http://localhost:3000/video/thumbnail \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  -d '{
+    "owner": "meno",
+    "permlink": "abc123",
+    "thumbnail": "ipfs://QmNewThumbnailCID"
+  }'
 
 # Get view counts for multiple videos
 curl -X POST http://localhost:3000/views \
@@ -319,7 +474,7 @@ The API uses multiple MongoDB collections:
 ```json
 {
   "user_id": "48d37d99-34ec-4098-be92-682dbbb93379",
-  "email": "menoecua@gmail.com",
+  "email": "menosoft@gmail.com",
   "last_identity": ObjectId("612bf9256b1c8555334eec15"),
   // ... other fields
 }
@@ -335,7 +490,7 @@ The API uses multiple MongoDB collections:
 }
 ```
 
-### videos Collection (for /getjobid and /videos/tag endpoints)
+### videos Collection (for /getjobid, /videos/tag, and /video/thumbnail endpoints)
 ```json
 {
   "owner": "tovia01",
@@ -344,15 +499,45 @@ The API uses multiple MongoDB collections:
   "title": "testing video upload OPH",
   "tags": "hive,hiveproject,threespeak,devlog,pob",
   "tags_v2": ["hive", "hiveproject", "threespeak", "devlog", "pob"],
+  "thumbnail": "ipfs://QmXXXXXX",
   "created": "2026-01-14T04:12:57.275Z",
   // ... other fields
 }
 ```
 
-**Recommended Index for Performance:**
+### embed-video Collection (for /shorts endpoint)
+```json
+{
+  "owner": "ismeris",
+  "permlink": "dyprlkq4",
+  "frontend_app": "snapie",
+  "status": "published",
+  "short": true,
+  "thumbnail_url": "https://...",
+  "duration": null,
+  "views": 5,
+  "createdAt": "2026-01-24T18:14:29.649Z",
+  // ... other fields
+}
+```
+
+**Recommended Indexes for Performance:**
 ```javascript
 // For optimal performance of /videos/tag endpoint
 db.videos.createIndex({ tags_v2: 1, created: -1 })
+
+// For optimal performance of /feed endpoint
+db.videos.createIndex({ owner: 1, created: -1 })
+
+// For optimal performance of /shorts endpoint
+db['embed-video'].createIndex({ short: 1, status: 1, createdAt: -1 })
+db['embed-video'].createIndex({ short: 1, status: 1, frontend_app: 1, createdAt: -1 })
+```
+
+To automatically create all recommended indexes, run:
+```bash
+cd scripts
+node create-indexes.js
 ```
 
 ## Environment Variables
@@ -363,6 +548,10 @@ db.videos.createIndex({ tags_v2: 1, created: -1 })
 | `MONGODB_URI` | MongoDB connection string | - | Yes |
 | `DATABASE_NAME` | MongoDB database name | - | Yes |
 | `COLLECTION_NAME` | MongoDB collection name | - | Yes |
+| `API_SECRET_KEY` | Secret key for protected endpoints | - | Yes* |
+| `AUTH_JWT_SECRET` | JWT secret for authentication | - | No |
+
+*Required only if using protected endpoints like `/video/thumbnail`
 
 ## Production Deployment
 
