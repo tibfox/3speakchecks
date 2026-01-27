@@ -252,19 +252,23 @@ Retrieves a feed of published short-form videos from the embed-video collection,
       "permlink": "dyprlkq4",
       "frontend_app": "snapie",
       "views": 5,
-      "createdAt": "2026-01-24T18:14:29.649Z"
+      "createdAt": "2026-01-24T18:14:29.649Z",
+      "thumbnail_url": "https://ipfs.3speak.tv/ipfs/QmRvP3E4wJAufWCKiuyP2dfkDX8ymzib2KE4bgvwujv4mN",
+      "embed_url": "@ismeris/snap-1737745800000",
+      "embed_title": "My short video"
     }
   ]
 }
 ```
 
 **Logic:**
-- Fetches from `embed-video` collection with filters: `short: true` and `status: "published"`
+- Fetches from `embed-video` collection with filters: `short: true`, `status: "published"`, and `processed: true`
 - Optional filtering by `frontend_app` for app-specific feeds
 - Results are sorted by `createdAt` field in descending order (newest first)
 - View counts are cached for 5 minutes to improve performance
-- Returns paginated results with metadata
+- Returns paginated results with metadata including thumbnail URLs, embed URLs, and titles
 - Frontend apps use the `frontend_app` field to display "created with" overlays
+- Only returns fully processed shorts ready for viewing
 
 **Example usage:**
 ```bash

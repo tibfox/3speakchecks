@@ -513,7 +513,8 @@ app.get('/shorts', async (req, res) => {
         // Build query for published shorts
         const query = { 
             short: true,
-            status: 'published'
+            status: 'published',
+            processed: true
         };
 
         // Add optional app filter
@@ -553,7 +554,10 @@ app.get('/shorts', async (req, res) => {
                     permlink: short.permlink,
                     frontend_app: short.frontend_app,
                     views: views,
-                    createdAt: short.createdAt
+                    createdAt: short.createdAt,
+                    thumbnail_url: short.thumbnail_url,
+                    embed_url: short.embed_url,
+                    embed_title: short.embed_title
                 };
             })
         );
