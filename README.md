@@ -11,6 +11,8 @@ A comprehensive REST API for managing and retrieving 3Speak video data, user per
 - Search videos by tag with pagination (newest first)
 - Get personalized video feeds based on Hive following list
 - Get shorts feed with optional app filtering
+- **Homepage Feeds**: Recommended, New Content, Trending, and First Uploads
+- Automated trending calculation via cron job (every 15 minutes)
 - Batch fetch video view counts with caching
 - Update video thumbnails (protected endpoint)
 - Environment-based configuration
@@ -285,6 +287,223 @@ curl "http://localhost:3000/shorts?app=snapie"
 curl "http://localhost:3000/shorts?app=threespeak"
 ```
 
+---
+
+## Homepage Feeds
+
+The API provides four curated feeds for the 3Speak homepage, each serving different content discovery purposes. All feeds exclude the internal `threespeak-fixer` account and only return published videos.
+
+### Get Recommended Feed
+```
+GET /feeds/recommended?page={page}&limit={limit}
+```
+Returns curated/recommended videos flagged by administrators.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Max | Description |
+|-----------|------|---------|-----|-------------|
+| `page` | number | 1 | - | Page number for pagination |
+| `limit` | number | 50 | 100 | Results per page |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "feed": "recommended",
+  "page": 1,
+  "limit": 50,
+  "total": 2168,
+  "totalPages": 44,
+  "videos": [
+    {
+      "_id": "697fd107eed099d12ab95ab2",
+      "owner": "theycallmedan",
+      "permlink": "c9d9c5a3",
+      "title": "How to use Hive Encrypt",
+      "recommended": true,
+      "status": "published",
+      "views": 107,
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Returns videos with `recommended: true` flag
+- Only published videos (`status: "published"`)
+- Excludes `threespeak-fixer` internal account
+- Sorted by creation date (newest first)
+
+### Get New Content Feed
+```
+GET /feeds/new?page={page}&limit={limit}
+```
+Returns recently uploaded videos from established creators (excludes first-time uploaders and trending videos).
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Max | Description |
+|-----------|------|---------|-----|-------------|
+| `page` | number | 1 | - | Page number for pagination |
+| `limit` | number | 50 | 100 | Results per page |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "feed": "new",
+  "page": 1,
+  "limit": 50,
+  "total": 129976,
+  "totalPages": 2600,
+  "videos": [
+    {
+      "_id": "698000abc123...",
+      "owner": "username",
+      "permlink": "abc123",
+      "title": "My New Video",
+      "firstUpload": false,
+      "trending": false,
+      "status": "published",
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Returns recent content from established creators
+- Excludes first-time uploaders (`firstUpload != true`)
+- Excludes trending videos (`trending != true`)
+- Only published videos (`status: "published"`)
+- Excludes `threespeak-fixer` internal account
+- Sorted by creation date (newest first)
+
+### Get Trending Feed
+```
+GET /feeds/trending?page={page}&limit={limit}
+```
+Returns the top 50 trending videos based on engagement metrics from the last 7 days.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Max | Description |
+|-----------|------|---------|-----|-------------|
+| `page` | number | 1 | - | Page number for pagination |
+| `limit` | number | 50 | 100 | Results per page |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "feed": "trending",
+  "page": 1,
+  "limit": 50,
+  "total": 50,
+  "totalPages": 1,
+  "videos": [
+    {
+      "_id": "697fd107eed099d12ab95ab2",
+      "owner": "theycallmedan",
+      "permlink": "c9d9c5a3",
+      "title": "Trending Video",
+      "trending": true,
+      "views": 107,
+      "status": "published",
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Automatically calculated by cron job every 15 minutes
+- Top 50 videos from the last 7 days based on engagement score:
+  - Views: 1 point each
+  - Votes: 2 points each
+  - Comments: 3 points each
+  - Hive rewards: 10 points each
+- Videos flagged with `trending: true`
+- Only published videos (`status: "published"`)
+- Excludes `threespeak-fixer` internal account
+- Sorted by creation date (newest first)
+
+### Get First Uploads Feed
+```
+GET /feeds/firstUploads?page={page}&limit={limit}
+```
+Returns videos from first-time creators (excludes trending videos to avoid duplication).
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Max | Description |
+|-----------|------|---------|-----|-------------|
+| `page` | number | 1 | - | Page number for pagination |
+| `limit` | number | 50 | 100 | Results per page |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "feed": "firstUploads",
+  "page": 1,
+  "limit": 50,
+  "total": 2772,
+  "totalPages": 56,
+  "videos": [
+    {
+      "_id": "697ecc8bc05ccfd7529649c4",
+      "owner": "consumerbreak",
+      "permlink": "lloyvhlxdm",
+      "title": "My First Video",
+      "firstUpload": true,
+      "trending": false,
+      "status": "published",
+      // ... other video fields
+    }
+  ]
+}
+```
+
+**Logic:**
+- Returns videos with `firstUpload: true` flag
+- Excludes trending videos (`trending != true`)
+- Only published videos (`status: "published"`)
+- Excludes `threespeak-fixer` internal account
+- Sorted by creation date (newest first)
+
+**Feed Hierarchy:**
+Videos are shown in only one feed based on priority:
+1. **Trending** (highest priority) - if flagged as trending, appears only here
+2. **Recommended** - manually curated content
+3. **New Content** - recent uploads from established creators
+4. **First Uploads** - content from new creators
+
+**Automated Trending Calculation:**
+The trending feed is automatically updated:
+- On server startup (immediate calculation)
+- Every 15 minutes via cron job
+- Ensures fresh trending content without manual intervention
+
+**Example usage:**
+```bash
+# Get recommended videos
+curl http://localhost:3000/feeds/recommended
+
+# Get new content with pagination
+curl "http://localhost:3000/feeds/new?page=2&limit=20"
+
+# Get trending videos
+curl http://localhost:3000/feeds/trending
+
+# Get first uploads
+curl "http://localhost:3000/feeds/firstUploads?page=1&limit=25"
+```
+
+---
+
 ### Get Video View Counts
 ```
 POST /views
@@ -439,6 +658,18 @@ curl http://localhost:3000/shorts
 # Get shorts feed with pagination and app filter
 curl "http://localhost:3000/shorts?page=1&limit=20&app=snapie"
 
+# Get recommended feed
+curl http://localhost:3000/feeds/recommended
+
+# Get new content feed with pagination
+curl "http://localhost:3000/feeds/new?page=2&limit=30"
+
+# Get trending videos
+curl http://localhost:3000/feeds/trending
+
+# Get first uploads feed
+curl "http://localhost:3000/feeds/firstUploads?page=1&limit=25"
+
 # Update video thumbnail (protected endpoint)
 curl -X PUT http://localhost:3000/video/thumbnail \
   -H "Content-Type: application/json" \
@@ -536,6 +767,12 @@ db.videos.createIndex({ owner: 1, created: -1 })
 // For optimal performance of /shorts endpoint
 db['embed-video'].createIndex({ short: 1, status: 1, createdAt: -1 })
 db['embed-video'].createIndex({ short: 1, status: 1, frontend_app: 1, createdAt: -1 })
+
+// For optimal performance of homepage feeds
+db.videos.createIndex({ recommended: 1, status: 1, created: -1 })
+db.videos.createIndex({ firstUpload: 1, trending: 1, status: 1, created: -1 })
+db.videos.createIndex({ trending: 1, status: 1, created: -1 })
+db.videos.createIndex({ status: 1, owner: 1, created: -1 })
 ```
 
 To automatically create all recommended indexes, run:
