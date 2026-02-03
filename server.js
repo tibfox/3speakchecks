@@ -1,6 +1,7 @@
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
+const cron = require('node-cron');
 require('dotenv').config();
 
 const app = express();
@@ -111,7 +112,7 @@ async function getFollowingList(username) {
 
     try {
         const response = await fetch(
-            `https://api.syncad.com/hafsql/accounts/${username}/following?limit=1000`,
+            `https://api.hive.blog/hafsql/accounts/${username}/following?limit=1000`,
             { 
                 headers: { 'accept': 'application/json' },
                 timeout: 5000 // 5 second timeout
@@ -140,11 +141,72 @@ async function getFollowingList(username) {
     }
 }
 
+// Calculate and flag trending videos
+async function calculateAndFlagTrendingVideos() {
+    try {
+        console.log('Calculating trending videos...');
+        const videosCollection = db.collection('videos');
+        
+        // Calculate trending over the last 7 days
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        
+        // First, unflag all current trending videos
+        await videosCollection.updateMany(
+            { trending: true },
+            { $set: { trending: false } }
+        );
+        
+        // Calculate trending scores and get top 50 videos
+        const trendingVideos = await videosCollection.aggregate([
+            {
+                $match: {
+                    status: 'published',
+                    owner: { $ne: 'threespeak-fixer' },
+                    created: { $gte: sevenDaysAgo }
+                }
+            },
+            {
+                $addFields: {
+                    trending_score: {
+                        $add: [
+                            { $multiply: [{ $ifNull: ['$views', 0] }, 1] },
+                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, 2] },
+                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, 3] },
+                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, 10] }
+                        ]
+                    }
+                }
+            },
+            {
+                $sort: { trending_score: -1 }
+            },
+            {
+                $limit: 50
+            }
+        ]).toArray();
+        
+        // Flag the top 50 as trending
+        if (trendingVideos.length > 0) {
+            const trendingIds = trendingVideos.map(v => v._id);
+            await videosCollection.updateMany(
+                { _id: { $in: trendingIds } },
+                { $set: { trending: true } }
+            );
+            console.log(`Flagged ${trendingVideos.length} videos as trending`);
+        } else {
+            console.log('No trending videos found');
+        }
+        
+    } catch (error) {
+        console.error('Error calculating trending videos:', error);
+    }
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({ 
-        message: 'CheckBanned API is running',
-        version: '1.2.0',
+        message: 'Pancreas API is running',
+        version: '1.3.0',
         endpoints: {
             check: '/check/:username',
             gethive: '/gethive/:user_id',
@@ -154,7 +216,11 @@ app.get('/', (req, res) => {
             videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}',
             feed: 'GET /feed/:username?page={page}&limit={limit}',
             shorts: 'GET /shorts?page={page}&limit={limit}&app={frontend_app}',
-            updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)'
+            updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)',
+            feedRecommended: 'GET /feeds/recommended?page={page}&limit={limit}',
+            feedNew: 'GET /feeds/new?page={page}&limit={limit}',
+            feedTrending: 'GET /feeds/trending?page={page}&limit={limit}',
+            feedFirstUploads: 'GET /feeds/firstUploads?page={page}&limit={limit}'
         }
     });
 });
@@ -664,6 +730,206 @@ app.post('/views', async (req, res) => {
     }
 });
 
+// ====== HOMEPAGE FEEDS ======
+
+// Endpoint to get recommended feed
+app.get('/feeds/recommended', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        
+        // Query for recommended videos
+        const query = { 
+            recommended: true,
+            status: 'published',
+            owner: { $ne: 'threespeak-fixer' }
+        };
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending (newest first)
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            success: true,
+            feed: 'recommended',
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching recommended feed:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get new content feed (excludes first uploads)
+app.get('/feeds/new', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        
+        // Query for new content (exclude first uploads and trending)
+        const query = { 
+            status: 'published',
+            owner: { $ne: 'threespeak-fixer' },
+            firstUpload: { $ne: true },
+            trending: { $ne: true }
+        };
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending (newest first)
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            success: true,
+            feed: 'new',
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching new content feed:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get trending feed
+app.get('/feeds/trending', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        
+        // Query for trending videos
+        const query = { 
+            trending: true,
+            status: 'published',
+            owner: { $ne: 'threespeak-fixer' }
+        };
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            success: true,
+            feed: 'trending',
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching trending feed:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get first uploads feed
+app.get('/feeds/firstUploads', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        
+        // Query for first time uploads (exclude trending)
+        const query = { 
+            firstUpload: true,
+            status: 'published',
+            owner: { $ne: 'threespeak-fixer' },
+            trending: { $ne: true }
+        };
+
+        // Get total count for pagination
+        const total = await videosCollection.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        // Fetch videos with pagination, sorted by created descending (newest first)
+        const videos = await videosCollection
+            .find(query)
+            .sort({ created: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        // Return response
+        res.json({
+            success: true,
+            feed: 'firstUploads',
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            videos: videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching first uploads feed:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
 /**
  * Protected endpoint to update video thumbnail
  * Requires API key authentication via Authorization header
@@ -764,6 +1030,17 @@ app.put('/video/thumbnail', validateApiKey, async (req, res) => {
 // Start server
 async function startServer() {
     await connectToMongo();
+    
+    // Initialize trending videos on startup
+    console.log('Initializing trending videos...');
+    await calculateAndFlagTrendingVideos();
+    
+    // Schedule trending calculation to run every 15 minutes
+    cron.schedule('*/15 * * * *', () => {
+        console.log('Running scheduled trending calculation...');
+        calculateAndFlagTrendingVideos();
+    });
+    console.log('Trending calculation scheduled to run every 15 minutes');
     
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
