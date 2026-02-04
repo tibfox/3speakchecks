@@ -576,11 +576,16 @@ app.get('/shorts', async (req, res) => {
         // Query the embed-video collection
         const embedVideoCollection = db.collection('embed-video');
         
-        // Build query for published shorts
+        // Build query for published shorts from last 7 days
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        
         const query = { 
             short: true,
             status: 'published',
-            processed: true
+            processed: true,
+            embed_url: { $exists: true, $ne: null },
+            createdAt: { $gte: sevenDaysAgo }
         };
 
         // Add optional app filter
@@ -589,21 +594,38 @@ app.get('/shorts', async (req, res) => {
             console.log(`Fetching shorts for app: ${appFilter}`);
         }
 
-        // Get total count for pagination
-        const total = await embedVideoCollection.countDocuments(query);
-        const totalPages = Math.ceil(total / limit);
-
-        // Fetch shorts with pagination, sorted by createdAt descending (newest first)
+        // Fetch recent shorts (last 7 days) sorted by newest first
         const shortsData = await embedVideoCollection
             .find(query)
             .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
             .toArray();
+
+        // Deduplicate: Keep only the most recent short for each user+thumbnail combination
+        const seenVideos = new Map(); // key: "owner|thumbnail_url", value: short object
+        const deduplicatedShorts = [];
+        
+        for (const short of shortsData) {
+            const dedupeKey = `${short.owner}|${short.thumbnail_url || 'no-thumb'}`;
+            
+            // Only add if we haven't seen this user+thumbnail combo, or if thumbnail is null
+            if (!seenVideos.has(dedupeKey) || !short.thumbnail_url) {
+                seenVideos.set(dedupeKey, short);
+                deduplicatedShorts.push(short);
+            }
+        }
+
+        // Randomize the order using Fisher-Yates shuffle
+        for (let i = deduplicatedShorts.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [deduplicatedShorts[i], deduplicatedShorts[j]] = [deduplicatedShorts[j], deduplicatedShorts[i]];
+        }
+
+        // Apply pagination to randomized results
+        const paginatedShorts = deduplicatedShorts.slice(skip, skip + limit);
 
         // Get view counts with caching
         const shorts = await Promise.all(
-            shortsData.map(async (short) => {
+            paginatedShorts.map(async (short) => {
                 const key = `${short.owner}/${short.permlink}`;
                 
                 // Check cache first
@@ -627,6 +649,10 @@ app.get('/shorts', async (req, res) => {
                 };
             })
         );
+
+        // Calculate pagination based on deduplicated count
+        const total = deduplicatedShorts.length;
+        const totalPages = Math.ceil(total / limit);
 
         // Return response
         res.json({
