@@ -11,10 +11,12 @@ A comprehensive REST API for managing and retrieving 3Speak video data, user per
 - Search videos by tag with pagination (newest first)
 - Get personalized video feeds based on Hive following list
 - Get shorts feed with optional app filtering
+- Get sorted shorts feed with reward-weighted bucket sorting and deterministic pagination
 - **Homepage Feeds**: Recommended, New Content, Trending, and First Uploads
 - Automated trending calculation via cron job (every 15 minutes)
 - Batch fetch video view counts with caching
 - Update video thumbnails (protected endpoint)
+- Feature flags for safe deployment (`ENABLE_MONGO_WRITES`)
 - Environment-based configuration
 - CORS enabled for cross-origin requests
 - Health check endpoint
@@ -285,6 +287,81 @@ curl "http://localhost:3000/shorts?app=snapie"
 
 # Get only 3Speak shorts
 curl "http://localhost:3000/shorts?app=threespeak"
+```
+
+### Get Sorted Shorts Feed
+```
+GET /shortssorted?page={page}&limit={limit}&app={frontend_app}&seed={seed}
+```
+Retrieves a sorted shorts feed using weighted random scoring with deterministic seeded pagination. Each short receives a composite score combining Hive reward value, recency, and seeded randomness — surfacing higher-rewarded content while still appearing random.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number for pagination (minimum: 1) |
+| `limit` | number | 20 | Results per page (minimum: 1, maximum: 100) |
+| `app` | string | all | Optional filter by frontend_app (e.g., "snapie", "threespeak") |
+| `seed` | number | auto-generated | Seed for deterministic shuffle. Reuse across pages for consistent ordering |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "seed": 847293156,
+  "page": 1,
+  "limit": 20,
+  "total": 150,
+  "totalPages": 8,
+  "app": "all",
+  "shorts": [
+    {
+      "owner": "lordbutterfly",
+      "permlink": "1fgcz7m4",
+      "frontend_app": "snapie",
+      "views": 11,
+      "hive_reward": 0.33,
+      "hive_title": "My short video title",
+      "hive_body": "Full post body from Hive...",
+      "hive_tags": ["threespeak", "shorts", "hive"],
+      "hive_votes": 12,
+      "hive_comments": 3,
+      "hive_author_reputation": 69.0,
+      "hive_followers": 245,
+      "createdAt": "2026-02-09T16:18:31.943Z",
+      "thumbnail_url": "https://...",
+      "embed_url": "@lordbutterfly/20260209t162316225z",
+      "embed_title": "Comment"
+    }
+  ]
+}
+```
+
+**Logic:**
+- Fetches from `embed-video` collection (last 14 days) with the same base filters as `/shorts`
+- Fetches Hive content data (reward, title, body, tags) for all shorts via RPC (`condenser_api.get_content`) in batches of 20 — cached for 15 minutes
+- **Reputation filtering**: Authors with Hive reputation <= 15 are excluded from results
+- Each short gets a weighted sort score: `recency_bonus + normalized_reward * REWARD_WEIGHT + seeded_random * (1 - REWARD_WEIGHT)`
+  - **Recency bonus**: 4 recent buckets (0–8 days, `SHORT_SORT_INTERVAL` days each) + 1 big bucket (8–14 days) where older content competes on reward + randomness
+  - **Reward component**: Normalized against max reward, weighted by `REWARD_WEIGHT` (default: 0.7)
+  - **Random component**: Seeded PRNG provides deterministic variety
+- **Consecutive author dedup**: If the same author appears multiple times in a row after sorting, only the first occurrence is kept
+- **Sorted list caching**: The full sorted order (with title, body, tags) is cached for 15 minutes per seed+app combination — page 2+ requests skip the entire sort pipeline
+- Same seed = same sort order = no duplicates across pages
+- If no `seed` is provided, one is auto-generated and returned in the response
+- Live-changing data (votes, comments, reward, reputation) is fetched fresh for the current page; title, body, and tags come from the cached sorted list
+- Follower counts are cached separately for 4 hours; author reputation is cached for 8 hours
+
+**Example usage:**
+```bash
+# Get sorted shorts (seed auto-generated)
+curl http://localhost:3000/shortssorted
+
+# Get page 2 with same seed for consistent ordering
+curl "http://localhost:3000/shortssorted?page=2&limit=20&seed=847293156"
+
+# Filter by app
+curl "http://localhost:3000/shortssorted?app=snapie&seed=847293156"
 ```
 
 ---
@@ -658,6 +735,12 @@ curl http://localhost:3000/shorts
 # Get shorts feed with pagination and app filter
 curl "http://localhost:3000/shorts?page=1&limit=20&app=snapie"
 
+# Get sorted shorts feed (reward-weighted, seeded pagination)
+curl http://localhost:3000/shortssorted
+
+# Get sorted shorts page 2 with same seed
+curl "http://localhost:3000/shortssorted?page=2&seed=847293156"
+
 # Get recommended feed
 curl http://localhost:3000/feeds/recommended
 
@@ -791,6 +874,10 @@ node create-indexes.js
 | `COLLECTION_NAME` | MongoDB collection name | - | Yes |
 | `API_SECRET_KEY` | Secret key for protected endpoints | - | Yes* |
 | `AUTH_JWT_SECRET` | JWT secret for authentication | - | No |
+| `ENABLE_MONGO_WRITES` | Enable MongoDB write operations (trending calc, thumbnail updates) | `true` | No |
+| `SHORT_SORT_INTERVAL` | Time bucket size in days for `/shortssorted` recency bonus | `2` | No |
+| `REWARD_WEIGHT` | Weight for reward vs randomness in sort score (0-1, higher = more reward influence) | `0.7` | No |
+| `HIVE_RPC_ENDPOINTS` | Hive RPC endpoints (comma-separated, tries in order on failure) | `https://techcoderx.com,https://api.deathwing.me,https://api.hive.blog` | No |
 
 *Required only if using protected endpoints like `/video/thumbnail`
 
