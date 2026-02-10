@@ -1,4 +1,4 @@
-# CheckBanned API
+# CheckBanned API aka Pancreas API
 
 A comprehensive REST API for managing and retrieving 3Speak video data, user permissions, and Hive account information from MongoDB.
 
