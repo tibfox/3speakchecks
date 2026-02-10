@@ -10,6 +10,11 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = process.env.DATABASE_NAME || 'threespeak';
 const COLLECTION_NAME = process.env.COLLECTION_NAME || 'contentcreators';
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
+const ENABLE_MONGO_WRITES = process.env.ENABLE_MONGO_WRITES !== 'false'; // defaults to true
+const SHORT_SORT_INTERVAL = parseInt(process.env.SHORT_SORT_INTERVAL) || 2; // days per time bucket
+const HIVE_RPC_ENDPOINTS = (process.env.HIVE_RPC_ENDPOINTS || process.env.HIVE_RPC_ENDPOINT || 'https://techcoderx.com,https://api.deathwing.me,https://api.hive.blog')
+    .split(',').map(s => s.trim()).filter(Boolean);
+const REWARD_WEIGHT = parseFloat(process.env.REWARD_WEIGHT) || 0.7; // weight for reward vs random (0-1, higher = more reward influence)
 
 // Middleware
 app.use(cors());
@@ -86,6 +91,232 @@ function setCachedViews(key, views) {
     viewsCache.set(key, { views, timestamp: Date.now() });
 }
 
+// Hive reward cache (15 minute TTL)
+const rewardCache = new Map();
+const REWARD_CACHE_TTL = 15 * 60 * 1000;
+
+// Sorted shorts list cache (keyed by "seed|app", 15 minute TTL, max 100 entries)
+const sortedShortsCache = new Map();
+const SORTED_SHORTS_CACHE_TTL = 15 * 60 * 1000;
+
+// Author reputation cache (8 hour TTL, keyed by author)
+const reputationCache = new Map();
+const REPUTATION_CACHE_TTL = 8 * 60 * 60 * 1000;
+
+// Follower count cache TTL (4 hours)
+const FOLLOWER_CACHE_TTL = 4 * 60 * 60 * 1000;
+
+// Send a batch RPC request, trying each endpoint in order until one succeeds
+async function hiveRpcBatch(rpcBatch) {
+    for (const endpoint of HIVE_RPC_ENDPOINTS) {
+        try {
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(rpcBatch),
+                signal: AbortSignal.timeout(10000)
+            });
+            const results = await response.json();
+            return Array.isArray(results) ? results : [results];
+        } catch (error) {
+            console.error(`Hive RPC failed for ${endpoint}:`, error.message);
+        }
+    }
+    return []; // all endpoints failed
+}
+
+// Convert raw Hive reputation to human-readable score (e.g., 9999999999999 -> ~69)
+function hiveReputationToScore(rawReputation) {
+    const rep = parseInt(rawReputation);
+    if (isNaN(rep) || rep === 0) return 25;
+    const neg = rep < 0;
+    const absRep = Math.abs(rep);
+    let score = Math.log10(absRep) - 9;
+    if (score < 0) score = 0;
+    score = score * (neg ? -9 : 9) + 25;
+    return Math.round(score * 10) / 10;
+}
+
+// Fetch Hive reward + content data for sorting — caches reward, title, body, tags (15min TTL)
+// Live-changing fields (votes, comments, reputation) come from fetchLivePageData()
+async function fetchHiveRewards(authorPerms) {
+    const results = new Map(); // key: "author/permlink" -> { reward, title, body, tags }
+    const toFetch = [];
+
+    // Check cache first
+    for (const { author, permlink } of authorPerms) {
+        const key = `${author}/${permlink}`;
+        const cached = rewardCache.get(key);
+        if (cached && Date.now() - cached.timestamp < REWARD_CACHE_TTL) {
+            results.set(key, { reward: cached.reward, title: cached.title || '', body: cached.body || '', tags: cached.tags || [] });
+        } else {
+            toFetch.push({ author, permlink, key });
+        }
+    }
+
+    // Batch fetch uncached rewards in groups of 20
+    for (let i = 0; i < toFetch.length; i += 20) {
+        const batch = toFetch.slice(i, i + 20);
+        const rpcBatch = batch.map((item, idx) => ({
+            jsonrpc: '2.0',
+            id: i + idx,
+            method: 'condenser_api.get_content',
+            params: [item.author, item.permlink]
+        }));
+
+        const resultsArray = await hiveRpcBatch(rpcBatch);
+
+        for (const rpcResult of resultsArray) {
+            if (!rpcResult.result) continue;
+            const post = rpcResult.result;
+            const postKey = `${post.author}/${post.permlink}`;
+
+            const pending = parseFloat(post.pending_payout_value) || 0;
+            const paid = parseFloat(post.total_payout_value) || 0;
+            const curator = parseFloat(post.curator_payout_value) || 0;
+            const reward = pending + paid + curator;
+
+            // Extract content data (title, body, tags) - these rarely change
+            const title = post.title || '';
+            const body = post.body || '';
+            let tags = [];
+            try {
+                const metadata = JSON.parse(post.json_metadata || '{}');
+                tags = Array.isArray(metadata.tags) ? metadata.tags : [];
+            } catch (e) { /* ignore */ }
+
+            results.set(postKey, { reward, title, body, tags });
+            rewardCache.set(postKey, { reward, title, body, tags, timestamp: Date.now() });
+
+            // Side-effect: refresh reputation cache from the response we already have
+            if (!reputationCache.has(post.author) || Date.now() - (reputationCache.get(post.author)?.timestamp || 0) >= REPUTATION_CACHE_TTL) {
+                reputationCache.set(post.author, { reputation: hiveReputationToScore(post.author_reputation), timestamp: Date.now() });
+            }
+        }
+
+        for (const item of batch) {
+            if (!results.has(item.key)) {
+                results.set(item.key, { reward: 0, title: '', body: '', tags: [] });
+            }
+        }
+    }
+
+    return results;
+}
+
+// Fetch live display data for the current page (no cache for post-level data)
+// Returns all fields needed for the response: title, body, tags, votes, comments, reward, reputation
+// Also refreshes reward + reputation caches as a side effect
+async function fetchLivePageData(authorPerms) {
+    const results = new Map(); // key: "author/permlink" -> { reward, title, body, tags, votes, comments, author_reputation }
+
+    for (let i = 0; i < authorPerms.length; i += 20) {
+        const batch = authorPerms.slice(i, i + 20);
+        const rpcBatch = batch.map((item, idx) => ({
+            jsonrpc: '2.0',
+            id: i + idx,
+            method: 'condenser_api.get_content',
+            params: [item.author, item.permlink]
+        }));
+
+        const resultsArray = await hiveRpcBatch(rpcBatch);
+
+        for (const rpcResult of resultsArray) {
+            if (!rpcResult.result) continue;
+            const post = rpcResult.result;
+            const postKey = `${post.author}/${post.permlink}`;
+
+            const pending = parseFloat(post.pending_payout_value) || 0;
+            const paid = parseFloat(post.total_payout_value) || 0;
+            const curator = parseFloat(post.curator_payout_value) || 0;
+            const reward = pending + paid + curator;
+
+            const title = post.title || '';
+            const body = post.body || '';
+            const votes = post.net_votes || 0;
+            const comments = post.children || 0;
+            const author_reputation = hiveReputationToScore(post.author_reputation);
+
+            let tags = [];
+            try {
+                const metadata = JSON.parse(post.json_metadata || '{}');
+                tags = Array.isArray(metadata.tags) ? metadata.tags : [];
+            } catch (e) { /* ignore */ }
+
+            results.set(postKey, { reward, title, body, tags, votes, comments, author_reputation });
+
+            // Side-effect: refresh reward + reputation caches (include content data so fetchHiveRewards cache hits retain it)
+            rewardCache.set(postKey, { reward, title, body, tags, timestamp: Date.now() });
+            reputationCache.set(post.author, { reputation: author_reputation, timestamp: Date.now() });
+        }
+
+        for (const item of batch) {
+            const key = `${item.author}/${item.permlink}`;
+            if (!results.has(key)) {
+                results.set(key, { reward: 0, title: '', body: '', tags: [], votes: 0, comments: 0, author_reputation: 25 });
+            }
+        }
+    }
+
+    return results;
+}
+
+// Follower count cache (keyed by author, uses FOLLOWER_CACHE_TTL)
+const followerCache = new Map();
+
+// Fetch follower counts via RPC in batches of 20
+async function fetchFollowerCounts(authors) {
+    const results = new Map(); // key: author -> follower_count
+    const toFetch = [];
+
+    for (const author of authors) {
+        const cached = followerCache.get(author);
+        if (cached && Date.now() - cached.timestamp < FOLLOWER_CACHE_TTL) {
+            results.set(author, cached.followers);
+        } else {
+            toFetch.push(author);
+        }
+    }
+
+    for (let i = 0; i < toFetch.length; i += 20) {
+        const batch = toFetch.slice(i, i + 20);
+        const rpcBatch = batch.map((author, idx) => ({
+            jsonrpc: '2.0',
+            id: i + idx,
+            method: 'condenser_api.get_follow_count',
+            params: [author]
+        }));
+
+        const resultsArray = await hiveRpcBatch(rpcBatch);
+
+        for (const rpcResult of resultsArray) {
+            if (!rpcResult.result) continue;
+            const account = rpcResult.result.account;
+            const followers = rpcResult.result.follower_count || 0;
+            results.set(account, followers);
+            followerCache.set(account, { followers, timestamp: Date.now() });
+        }
+
+        for (const author of batch) {
+            if (!results.has(author)) {
+                results.set(author, 0);
+            }
+        }
+    }
+
+    return results;
+}
+
+// Seeded PRNG (mulberry32) - returns a function that produces deterministic 0-1 values
+function mulberry32(seed) {
+    return function() {
+        seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+        let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+}
+
 // Following list cache (10 minute TTL)
 const followingCache = new Map();
 const FOLLOWING_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
@@ -143,6 +374,10 @@ async function getFollowingList(username) {
 
 // Calculate and flag trending videos
 async function calculateAndFlagTrendingVideos() {
+    if (!ENABLE_MONGO_WRITES) {
+        console.log('Skipping trending calculation (ENABLE_MONGO_WRITES=false)');
+        return;
+    }
     try {
         console.log('Calculating trending videos...');
         const videosCollection = db.collection('videos');
@@ -216,6 +451,7 @@ app.get('/', (req, res) => {
             videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}',
             feed: 'GET /feed/:username?page={page}&limit={limit}',
             shorts: 'GET /shorts?page={page}&limit={limit}&app={frontend_app}',
+            shortsSorted: 'GET /shortssorted?page={page}&limit={limit}&app={frontend_app}&seed={seed}',
             updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)',
             feedRecommended: 'GET /feeds/recommended?page={page}&limit={limit}',
             feedNew: 'GET /feeds/new?page={page}&limit={limit}',
@@ -564,7 +800,7 @@ app.get('/feed/:username', async (req, res) => {
     }
 });
 
-// Endpoint to get shorts feed
+// Endpoint to get shorts feed (original)
 app.get('/shorts', async (req, res) => {
     try {
         // Extract pagination parameters
@@ -575,12 +811,12 @@ app.get('/shorts', async (req, res) => {
 
         // Query the embed-video collection
         const embedVideoCollection = db.collection('embed-video');
-        
+
         // Build query for published shorts from last 7 days
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-        
-        const query = { 
+
+        const query = {
             short: true,
             status: 'published',
             processed: true,
@@ -601,13 +837,11 @@ app.get('/shorts', async (req, res) => {
             .toArray();
 
         // Deduplicate: Keep only the most recent short for each user+thumbnail combination
-        const seenVideos = new Map(); // key: "owner|thumbnail_url", value: short object
+        const seenVideos = new Map();
         const deduplicatedShorts = [];
-        
+
         for (const short of shortsData) {
             const dedupeKey = `${short.owner}|${short.thumbnail_url || 'no-thumb'}`;
-            
-            // Only add if we haven't seen this user+thumbnail combo, or if thumbnail is null
             if (!seenVideos.has(dedupeKey) || !short.thumbnail_url) {
                 seenVideos.set(dedupeKey, short);
                 deduplicatedShorts.push(short);
@@ -627,16 +861,11 @@ app.get('/shorts', async (req, res) => {
         const shorts = await Promise.all(
             paginatedShorts.map(async (short) => {
                 const key = `${short.owner}/${short.permlink}`;
-                
-                // Check cache first
                 let views = getCachedViews(key);
-                
-                // If not cached, use the views from the document and cache it
                 if (views === null) {
                     views = short.views ?? 0;
                     setCachedViews(key, views);
                 }
-
                 return {
                     owner: short.owner,
                     permlink: short.permlink,
@@ -650,11 +879,9 @@ app.get('/shorts', async (req, res) => {
             })
         );
 
-        // Calculate pagination based on deduplicated count
         const total = deduplicatedShorts.length;
         const totalPages = Math.ceil(total / limit);
 
-        // Return response
         res.json({
             success: true,
             page: page,
@@ -667,7 +894,233 @@ app.get('/shorts', async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching shorts:', error);
-        res.status(500).json({ 
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get sorted shorts feed with reward-weighted bucket sorting
+app.get('/shortssorted', async (req, res) => {
+    try {
+        // Extract pagination parameters
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+        const appFilter = req.query.app; // optional frontend_app filter
+        // Seed for deterministic shuffle - use provided seed or generate one
+        const seed = req.query.seed ? parseInt(req.query.seed) : Math.floor(Math.random() * 2147483647);
+
+        // Check sorted list cache (keyed by seed+app, stores only lightweight identifiers)
+        const cacheKey = `${seed}|${appFilter || 'all'}`;
+        let sortedShorts;
+        const cached = sortedShortsCache.get(cacheKey);
+
+        if (cached && Date.now() - cached.timestamp < SORTED_SHORTS_CACHE_TTL) {
+            sortedShorts = cached.list;
+        } else {
+            // Full pipeline: MongoDB query → dedup → rewards → filter → score → sort
+
+            // Query the embed-video collection
+            const embedVideoCollection = db.collection('embed-video');
+
+            // Build query for published shorts from last 14 days
+            const fourteenDaysAgo = new Date();
+            fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+
+            const query = {
+                short: true,
+                status: 'published',
+                processed: true,
+                embed_url: { $exists: true, $ne: null },
+                createdAt: { $gte: fourteenDaysAgo }
+            };
+
+            // Add optional app filter
+            if (appFilter) {
+                query.frontend_app = appFilter;
+                console.log(`Fetching sorted shorts for app: ${appFilter}`);
+            }
+
+            // Fetch recent shorts sorted by newest first
+            const shortsData = await embedVideoCollection
+                .find(query)
+                .sort({ createdAt: -1 })
+                .toArray();
+
+            // Deduplicate: Keep only the most recent short for each user+thumbnail combination
+            const seenVideos = new Map();
+            const deduplicatedShorts = [];
+
+            for (const short of shortsData) {
+                const dedupeKey = `${short.owner}|${short.thumbnail_url || 'no-thumb'}`;
+                if (!seenVideos.has(dedupeKey) || !short.thumbnail_url) {
+                    seenVideos.set(dedupeKey, short);
+                    deduplicatedShorts.push(short);
+                }
+            }
+
+            // Fetch Hive content data via RPC (extract author/permlink from embed_url "@author/permlink")
+            const authorPerms = deduplicatedShorts
+                .filter(s => s.embed_url)
+                .map(s => {
+                    const parts = s.embed_url.replace(/^@/, '').split('/');
+                    return { author: parts[0], permlink: parts[1] };
+                });
+            // Fetch reward values for sorting (cached 15min)
+            const hiveRewards = await fetchHiveRewards(authorPerms);
+
+            // Attach reward + content data to each short and filter out low-reputation authors
+            const filteredShorts = [];
+            for (const short of deduplicatedShorts) {
+                if (short.embed_url) {
+                    const parts = short.embed_url.replace(/^@/, '').split('/');
+                    const hiveData = hiveRewards.get(`${parts[0]}/${parts[1]}`) || { reward: 0, title: '', body: '', tags: [] };
+                    short.hive_reward = hiveData.reward;
+                    short.hive_title = hiveData.title;
+                    short.hive_body = hiveData.body;
+                    short.hive_tags = hiveData.tags;
+                    // Filter out authors with reputation <= 15 (spam/low-quality)
+                    const cachedRep = reputationCache.get(parts[0]);
+                    if (cachedRep && cachedRep.reputation <= 15) continue;
+                } else {
+                    short.hive_reward = 0;
+                    short.hive_title = '';
+                    short.hive_body = '';
+                    short.hive_tags = [];
+                }
+                filteredShorts.push(short);
+            }
+
+            // Weighted random score sorting
+            // Each short gets: sort_score = normalized_reward * REWARD_WEIGHT + seeded_random * (1 - REWARD_WEIGHT)
+            // This surfaces higher-rewarded content while still looking random
+            const rng = mulberry32(seed);
+            const now = new Date();
+            const intervalMs = SHORT_SORT_INTERVAL * 24 * 60 * 60 * 1000;
+
+            // Find max reward for normalization
+            const maxReward = Math.max(...filteredShorts.map(s => s.hive_reward || 0), 0.001);
+
+            // Assign weighted sort scores
+            for (const short of filteredShorts) {
+                const normalizedReward = (short.hive_reward || 0) / maxReward;
+                const randomComponent = rng();
+                // Time bucket bonus: 4 recent buckets (0-8 days) + 1 big bucket (8-14 days)
+                const age = now - new Date(short.createdAt);
+                const recentBuckets = Math.ceil(8 / SHORT_SORT_INTERVAL); // 4 buckets for first 8 days
+                const totalBuckets = recentBuckets + 1; // +1 for the big older bucket
+                let bucketIndex = Math.floor(age / intervalMs);
+                if (bucketIndex >= recentBuckets) bucketIndex = recentBuckets; // collapse everything 8+ days into one bucket
+                const recencyBonus = (totalBuckets - bucketIndex) / totalBuckets; // 1.0 for newest, decreasing
+
+                short.sort_score = recencyBonus + normalizedReward * REWARD_WEIGHT + randomComponent * (1 - REWARD_WEIGHT);
+            }
+
+            // Sort by score descending
+            const scoreSorted = [...filteredShorts].sort((a, b) => b.sort_score - a.sort_score);
+
+            // Remove consecutive shorts by the same author (keep first, skip until a different author appears)
+            sortedShorts = [];
+            let lastOwner = null;
+            for (const short of scoreSorted) {
+                if (short.owner !== lastOwner) {
+                    // Store identifiers + content data for the cache
+                    sortedShorts.push({
+                        owner: short.owner,
+                        permlink: short.permlink,
+                        embed_url: short.embed_url,
+                        thumbnail_url: short.thumbnail_url,
+                        embed_title: short.embed_title,
+                        frontend_app: short.frontend_app,
+                        createdAt: short.createdAt,
+                        views: short.views,
+                        hive_title: short.hive_title || '',
+                        hive_body: short.hive_body || '',
+                        hive_tags: short.hive_tags || []
+                    });
+                    lastOwner = short.owner;
+                }
+            }
+
+            // Cache the sorted list (evict expired entries if cache grows too large)
+            if (sortedShortsCache.size >= 100) {
+                const now = Date.now();
+                for (const [k, v] of sortedShortsCache) {
+                    if (now - v.timestamp >= SORTED_SHORTS_CACHE_TTL) sortedShortsCache.delete(k);
+                }
+            }
+            sortedShortsCache.set(cacheKey, { list: sortedShorts, timestamp: Date.now() });
+        }
+
+        // Apply pagination to sorted results
+        const paginatedShorts = sortedShorts.slice(skip, skip + limit);
+
+        // Fetch all display data for this page only (live from RPC, no post-level cache)
+        const pageAuthorPerms = paginatedShorts
+            .filter(s => s.embed_url)
+            .map(s => {
+                const parts = s.embed_url.replace(/^@/, '').split('/');
+                return { author: parts[0], permlink: parts[1] };
+            });
+        const pageUniqueAuthors = [...new Set(pageAuthorPerms.map(ap => ap.author))];
+        const [liveData, followerCounts] = await Promise.all([
+            fetchLivePageData(pageAuthorPerms),
+            fetchFollowerCounts(pageUniqueAuthors)
+        ]);
+
+        // Get view counts with caching
+        const shorts = await Promise.all(
+            paginatedShorts.map(async (short) => {
+                const key = `${short.owner}/${short.permlink}`;
+                let views = getCachedViews(key);
+                if (views === null) {
+                    views = short.views ?? 0;
+                    setCachedViews(key, views);
+                }
+                const embedParts = short.embed_url ? short.embed_url.replace(/^@/, '').split('/') : null;
+                const data = embedParts ? (liveData.get(`${embedParts[0]}/${embedParts[1]}`) || { reward: 0, votes: 0, comments: 0, author_reputation: 25 }) : { reward: 0, votes: 0, comments: 0, author_reputation: 25 };
+                const followers = embedParts ? (followerCounts.get(embedParts[0]) || 0) : 0;
+                return {
+                    owner: short.owner,
+                    permlink: short.permlink,
+                    frontend_app: short.frontend_app,
+                    views: views,
+                    hive_reward: data.reward,
+                    hive_title: short.hive_title || '',
+                    hive_body: short.hive_body || '',
+                    hive_tags: short.hive_tags || [],
+                    hive_votes: data.votes,
+                    hive_comments: data.comments,
+                    hive_author_reputation: data.author_reputation,
+                    hive_followers: followers,
+                    createdAt: short.createdAt,
+                    thumbnail_url: short.thumbnail_url,
+                    embed_url: short.embed_url,
+                    embed_title: short.embed_title
+                };
+            })
+        );
+
+        const total = sortedShorts.length;
+        const totalPages = Math.ceil(total / limit);
+
+        // Return response
+        res.json({
+            success: true,
+            seed: seed,
+            page: page,
+            limit: limit,
+            total: total,
+            totalPages: totalPages,
+            app: appFilter || 'all',
+            shorts: shorts
+        });
+
+    } catch (error) {
+        console.error('Error fetching sorted shorts:', error);
+        res.status(500).json({
             success: false,
             error: 'Internal server error'
         });
@@ -968,6 +1421,13 @@ app.get('/feeds/firstUploads', async (req, res) => {
  * }
  */
 app.put('/video/thumbnail', validateApiKey, async (req, res) => {
+    if (!ENABLE_MONGO_WRITES) {
+        return res.status(503).json({
+            success: false,
+            error: 'Writes disabled',
+            message: 'MongoDB writes are currently disabled (ENABLE_MONGO_WRITES=false)'
+        });
+    }
     try {
         const { owner, permlink, thumbnail } = req.body;
         
