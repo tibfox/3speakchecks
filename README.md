@@ -12,6 +12,7 @@ A comprehensive REST API for managing and retrieving 3Speak video data, user per
 - Get personalized video feeds based on Hive following list
 - Get shorts feed with optional app filtering
 - Get sorted shorts feed with reward-weighted bucket sorting and deterministic pagination
+- Get per-user shorts feed with pagination (all shorts by a specific user)
 - **Homepage Feeds**: Recommended, New Content, Trending, and First Uploads
 - Automated trending calculation via cron job (every 15 minutes)
 - Batch fetch video view counts with caching
@@ -316,7 +317,7 @@ Retrieves a sorted shorts feed using weighted random scoring with deterministic 
   "app": "all",
   "shorts": [
     {
-      "owner": "lordbutterfly",
+      "owner": "sergiomendes",
       "permlink": "1fgcz7m4",
       "frontend_app": "snapie",
       "views": 11,
@@ -330,7 +331,7 @@ Retrieves a sorted shorts feed using weighted random scoring with deterministic 
       "hive_followers": 245,
       "createdAt": "2026-02-09T16:18:31.943Z",
       "thumbnail_url": "https://...",
-      "embed_url": "@lordbutterfly/20260209t162316225z",
+      "embed_url": "@sergiomendes/20260209t162316225z",
       "embed_title": "Comment"
     }
   ]
@@ -362,6 +363,71 @@ curl "http://localhost:3000/shortssorted?page=2&limit=20&seed=847293156"
 
 # Filter by app
 curl "http://localhost:3000/shortssorted?app=snapie&seed=847293156"
+```
+
+### Get User Shorts Feed
+```
+GET /shorts/:username?page={page}&limit={limit}
+```
+Retrieves all shorts by a specific user, sorted by date descending. Same response shape as `/shortssorted` but without weighted scoring, time window limits, or consecutive-author dedup.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `username` | string | Hive username (1-50 characters) |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number for pagination (minimum: 1) |
+| `limit` | number | 20 | Results per page (minimum: 1, maximum: 100) |
+
+**Response format:**
+```json
+{
+  "success": true,
+  "page": 1,
+  "limit": 20,
+  "total": 42,
+  "totalPages": 3,
+  "shorts": [
+    {
+      "owner": "sergiomendes",
+      "permlink": "1fgcz7m4",
+      "views": 11,
+      "hive_reward": 0.33,
+      "hive_title": "My short video title",
+      "hive_body": "Full post body from Hive...",
+      "hive_tags": ["threespeak", "shorts", "hive"],
+      "hive_votes": 12,
+      "hive_comments": 3,
+      "hive_author_reputation": 69.0,
+      "hive_followers": 245,
+      "createdAt": "2026-02-09T16:18:31.943Z",
+      "thumbnail_url": "https://...",
+      "embed_url": "@sergiomendes/20260209t162316225z",
+      "embed_title": "Comment"
+    }
+  ]
+}
+```
+
+**Logic:**
+- Fetches from `embed-video` collection with filters: `short: true`, `status: "published"`, `processed: true`, `embed_url` exists, `owner: username`
+- No time window — returns all shorts for the user regardless of age
+- No weighted scoring or randomization — simply sorted by `createdAt` descending (newest first)
+- Uses the same Hive data enrichment as `/shortssorted`: rewards, title, body, tags, live votes/comments, reputation, follower counts
+- View counts cached for 5 minutes; Hive rewards cached for 15 minutes; follower counts cached for 4 hours
+
+**Example usage:**
+```bash
+# Get first 20 shorts by a user
+curl http://localhost:3000/shorts/sergiomendes
+
+# Get page 2 with 10 results
+curl "http://localhost:3000/shorts/sergiomendes?page=2&limit=10"
 ```
 
 ---
@@ -741,6 +807,12 @@ curl http://localhost:3000/shortssorted
 # Get sorted shorts page 2 with same seed
 curl "http://localhost:3000/shortssorted?page=2&seed=847293156"
 
+# Get all shorts by a specific user
+curl http://localhost:3000/shorts/sergiomendes
+
+# Get user shorts with pagination
+curl "http://localhost:3000/shorts/sergiomendes?page=2&limit=10"
+
 # Get recommended feed
 curl http://localhost:3000/feeds/recommended
 
@@ -850,6 +922,7 @@ db.videos.createIndex({ owner: 1, created: -1 })
 // For optimal performance of /shorts endpoint
 db['embed-video'].createIndex({ short: 1, status: 1, createdAt: -1 })
 db['embed-video'].createIndex({ short: 1, status: 1, frontend_app: 1, createdAt: -1 })
+db['embed-video'].createIndex({ short: 1, status: 1, processed: 1, owner: 1, createdAt: -1 })
 
 // For optimal performance of homepage feeds
 db.videos.createIndex({ recommended: 1, status: 1, created: -1 })

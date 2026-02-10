@@ -901,6 +901,123 @@ app.get('/shorts', async (req, res) => {
     }
 });
 
+// Endpoint to get all shorts by a specific user, sorted by date descending
+// Same response shape as /shortssorted but no weighted scoring, no time window, no dedup
+app.get('/shorts/:username', async (req, res) => {
+    try {
+        const { username } = req.params;
+        if (!username || username.length < 1 || username.length > 50) {
+            return res.status(400).json({ success: false, error: 'Invalid username' });
+        }
+
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const embedVideoCollection = db.collection('embed-video');
+
+        // Count total shorts for this user
+        const query = {
+            short: true,
+            status: 'published',
+            processed: true,
+            embed_url: { $exists: true, $ne: null },
+            owner: username
+        };
+
+        const [total, shortsData] = await Promise.all([
+            embedVideoCollection.countDocuments(query),
+            embedVideoCollection
+                .find(query)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray()
+        ]);
+
+        const totalPages = Math.ceil(total / limit);
+
+        if (shortsData.length === 0) {
+            return res.json({
+                success: true,
+                page,
+                limit,
+                total,
+                totalPages,
+                shorts: []
+            });
+        }
+
+        // Extract author/permlink pairs from embed_url
+        const authorPerms = shortsData
+            .filter(s => s.embed_url)
+            .map(s => {
+                const parts = s.embed_url.replace(/^@/, '').split('/');
+                return { author: parts[0], permlink: parts[1] };
+            });
+
+        // Fetch Hive rewards (for title, body, tags) and live data + followers in parallel
+        const uniqueAuthors = [...new Set(authorPerms.map(ap => ap.author))];
+        const [hiveRewards, liveData, followerCounts] = await Promise.all([
+            fetchHiveRewards(authorPerms),
+            fetchLivePageData(authorPerms),
+            fetchFollowerCounts(uniqueAuthors)
+        ]);
+
+        // Assemble response
+        const shorts = await Promise.all(
+            shortsData.map(async (short) => {
+                const viewKey = `${short.owner}/${short.permlink}`;
+                let views = getCachedViews(viewKey);
+                if (views === null) {
+                    views = short.views ?? 0;
+                    setCachedViews(viewKey, views);
+                }
+
+                const embedParts = short.embed_url ? short.embed_url.replace(/^@/, '').split('/') : null;
+                const rewardData = embedParts ? (hiveRewards.get(`${embedParts[0]}/${embedParts[1]}`) || { reward: 0, title: '', body: '', tags: [] }) : { reward: 0, title: '', body: '', tags: [] };
+                const live = embedParts ? (liveData.get(`${embedParts[0]}/${embedParts[1]}`) || { reward: 0, votes: 0, comments: 0, author_reputation: 25 }) : { reward: 0, votes: 0, comments: 0, author_reputation: 25 };
+                const followers = embedParts ? (followerCounts.get(embedParts[0]) || 0) : 0;
+
+                return {
+                    owner: short.owner,
+                    permlink: short.permlink,
+                    frontend_app: short.frontend_app,
+                    views: views,
+                    hive_reward: live.reward || rewardData.reward,
+                    hive_title: rewardData.title || short.embed_title || '',
+                    hive_body: rewardData.body || '',
+                    hive_tags: rewardData.tags || [],
+                    hive_votes: live.votes,
+                    hive_comments: live.comments,
+                    hive_author_reputation: live.author_reputation,
+                    hive_followers: followers,
+                    createdAt: short.createdAt,
+                    thumbnail_url: short.thumbnail_url,
+                    embed_url: short.embed_url,
+                    embed_title: short.embed_title
+                };
+            })
+        );
+
+        res.json({
+            success: true,
+            page,
+            limit,
+            total,
+            totalPages,
+            shorts
+        });
+
+    } catch (error) {
+        console.error('Error fetching user shorts:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
 // Endpoint to get sorted shorts feed with reward-weighted bucket sorting
 app.get('/shortssorted', async (req, res) => {
     try {
