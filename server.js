@@ -451,7 +451,7 @@ app.get('/', (req, res) => {
             videosByTag: 'GET /videos/tag/:tag?page={page}&limit={limit}',
             feed: 'GET /feed/:username?page={page}&limit={limit}',
             shorts: 'GET /shorts?page={page}&limit={limit}&app={frontend_app}',
-            shortsSorted: 'GET /shortssorted?page={page}&limit={limit}&app={frontend_app}&seed={seed}',
+            shortsSorted: 'GET /shortssorted?page={page}&limit={limit}&app={frontend_app}&seed={seed}&currentuser={username}',
             updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)',
             feedRecommended: 'GET /feeds/recommended?page={page}&limit={limit}',
             feedNew: 'GET /feeds/new?page={page}&limit={limit}',
@@ -1026,6 +1026,7 @@ app.get('/shortssorted', async (req, res) => {
         const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
         const skip = (page - 1) * limit;
         const appFilter = req.query.app; // optional frontend_app filter
+        const currentuser = req.query.currentuser; // optional: filter out shorts this user already watched
         // Seed for deterministic shuffle - use provided seed or generate one
         const seed = req.query.seed ? parseInt(req.query.seed) : Math.floor(Math.random() * 2147483647);
 
@@ -1169,6 +1170,19 @@ app.get('/shortssorted', async (req, res) => {
                 }
             }
             sortedShortsCache.set(cacheKey, { list: sortedShorts, timestamp: Date.now() });
+        }
+
+        // If currentuser is provided, filter out shorts the user has already watched.
+        // Uses _id lookup ($in on primary key) — only checks the shorts in the current list,
+        // so performance is independent of how large the user's total watch history is.
+        if (currentuser) {
+            const watchHistoryCollection = db.collection('watch_history');
+            const idsToCheck = sortedShorts.map(s => `${currentuser}:${s.owner}:${s.permlink}`);
+            const watchedEntries = await watchHistoryCollection
+                .find({ _id: { $in: idsToCheck } }, { projection: { _id: 1 } })
+                .toArray();
+            const watchedSet = new Set(watchedEntries.map(w => w._id));
+            sortedShorts = sortedShorts.filter(s => !watchedSet.has(`${currentuser}:${s.owner}:${s.permlink}`));
         }
 
         // Apply pagination to sorted results
