@@ -15,6 +15,7 @@ const SHORT_SORT_INTERVAL = parseInt(process.env.SHORT_SORT_INTERVAL) || 2; // d
 const HIVE_RPC_ENDPOINTS = (process.env.HIVE_RPC_ENDPOINTS || process.env.HIVE_RPC_ENDPOINT || 'https://techcoderx.com,https://api.deathwing.me,https://api.hive.blog')
     .split(',').map(s => s.trim()).filter(Boolean);
 const REWARD_WEIGHT = parseFloat(process.env.REWARD_WEIGHT) || 0.7; // weight for reward vs random (0-1, higher = more reward influence)
+const RESHARE_WEIGHT = parseFloat(process.env.RESHARE_WEIGHT) || 0.15; // weight for reshare influence (taken from random portion)
 
 // Middleware
 app.use(cors());
@@ -1111,19 +1112,51 @@ app.get('/shortssorted', async (req, res) => {
                 filteredShorts.push(short);
             }
 
+            // Fetch reshare counts for all filtered shorts in one aggregation query
+            const reshareCountMap = new Map();
+            const reshareOrConditions = filteredShorts
+                .filter(s => s.embed_url)
+                .map(s => {
+                    const parts = s.embed_url.replace(/^@/, '').split('/');
+                    return { author: parts[0], permlink: parts[1] };
+                });
+
+            if (reshareOrConditions.length > 0) {
+                const resharesCollection = db.collection('reshares');
+                const reshareCounts = await resharesCollection.aggregate([
+                    { $match: { $or: reshareOrConditions } },
+                    { $group: { _id: { author: "$author", permlink: "$permlink" }, count: { $sum: 1 } } }
+                ]).toArray();
+                for (const rc of reshareCounts) {
+                    reshareCountMap.set(`${rc._id.author}/${rc._id.permlink}`, rc.count);
+                }
+            }
+
+            // Attach reshare counts to shorts
+            for (const short of filteredShorts) {
+                if (short.embed_url) {
+                    const parts = short.embed_url.replace(/^@/, '').split('/');
+                    short.reshare_count = reshareCountMap.get(`${parts[0]}/${parts[1]}`) || 0;
+                } else {
+                    short.reshare_count = 0;
+                }
+            }
+
             // Weighted random score sorting
-            // Each short gets: sort_score = normalized_reward * REWARD_WEIGHT + seeded_random * (1 - REWARD_WEIGHT)
-            // This surfaces higher-rewarded content while still looking random
+            // sort_score = recencyBonus + reward * REWARD_WEIGHT + reshares * RESHARE_WEIGHT + random * remainder
             const rng = mulberry32(seed);
             const now = new Date();
             const intervalMs = SHORT_SORT_INTERVAL * 24 * 60 * 60 * 1000;
+            const randomWeight = Math.max(0, 1 - REWARD_WEIGHT - RESHARE_WEIGHT);
 
-            // Find max reward for normalization
+            // Find max reward and max reshares for normalization
             const maxReward = Math.max(...filteredShorts.map(s => s.hive_reward || 0), 0.001);
+            const maxReshares = Math.max(...filteredShorts.map(s => s.reshare_count || 0), 1);
 
             // Assign weighted sort scores
             for (const short of filteredShorts) {
                 const normalizedReward = (short.hive_reward || 0) / maxReward;
+                const normalizedReshares = (short.reshare_count || 0) / maxReshares;
                 const randomComponent = rng();
                 // Time bucket bonus: 4 recent buckets (0-8 days) + 1 big bucket (8-14 days)
                 const age = now - new Date(short.createdAt);
@@ -1133,7 +1166,7 @@ app.get('/shortssorted', async (req, res) => {
                 if (bucketIndex >= recentBuckets) bucketIndex = recentBuckets; // collapse everything 8+ days into one bucket
                 const recencyBonus = (totalBuckets - bucketIndex) / totalBuckets; // 1.0 for newest, decreasing
 
-                short.sort_score = recencyBonus + normalizedReward * REWARD_WEIGHT + randomComponent * (1 - REWARD_WEIGHT);
+                short.sort_score = recencyBonus + normalizedReward * REWARD_WEIGHT + normalizedReshares * RESHARE_WEIGHT + randomComponent * randomWeight;
             }
 
             // Sort by score descending
@@ -1156,7 +1189,8 @@ app.get('/shortssorted', async (req, res) => {
                         views: short.views,
                         hive_title: short.hive_title || '',
                         hive_body: short.hive_body || '',
-                        hive_tags: short.hive_tags || []
+                        hive_tags: short.hive_tags || [],
+                        reshare_count: short.reshare_count || 0
                     });
                     lastOwner = short.owner;
                 }
@@ -1226,6 +1260,7 @@ app.get('/shortssorted', async (req, res) => {
                     hive_comments: data.comments,
                     hive_author_reputation: data.author_reputation,
                     hive_followers: followers,
+                    reshare_count: short.reshare_count || 0,
                     createdAt: short.createdAt,
                     thumbnail_url: short.thumbnail_url,
                     embed_url: short.embed_url,
