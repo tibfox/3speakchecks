@@ -16,7 +16,12 @@ const HIVE_RPC_ENDPOINTS = (process.env.HIVE_RPC_ENDPOINTS || process.env.HIVE_R
     .split(',').map(s => s.trim()).filter(Boolean);
 const REWARD_WEIGHT = parseFloat(process.env.REWARD_WEIGHT) || 0.7; // weight for reward vs random (0-1, higher = more reward influence)
 const RESHARE_WEIGHT = parseFloat(process.env.RESHARE_WEIGHT) || 0.15; // weight for reshare influence (taken from random portion)
-const TRENDING_RESHARE_WEIGHT = parseFloat(process.env.TRENDING_RESHARE_WEIGHT) || 5; // weight for reshares in trending score
+const TRENDING_VIEWS_WEIGHT = parseFloat(process.env.TRENDING_VIEWS_WEIGHT) || 1;
+const TRENDING_VOTES_WEIGHT = parseFloat(process.env.TRENDING_VOTES_WEIGHT) || 2;
+const TRENDING_COMMENTS_WEIGHT = parseFloat(process.env.TRENDING_COMMENTS_WEIGHT) || 3;
+const TRENDING_REWARD_WEIGHT = parseFloat(process.env.TRENDING_REWARD_WEIGHT) || 10;
+const TRENDING_RESHARE_WEIGHT = parseFloat(process.env.TRENDING_RESHARE_WEIGHT) || 5;
+const TRENDING_CANDIDATE_LIMIT = parseInt(process.env.TRENDING_CANDIDATE_LIMIT) || 200;
 
 // Middleware
 app.use(cors());
@@ -406,10 +411,10 @@ async function calculateAndFlagTrendingVideos() {
                 $addFields: {
                     trending_score: {
                         $add: [
-                            { $multiply: [{ $ifNull: ['$views', 0] }, 1] },
-                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, 2] },
-                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, 3] },
-                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, 10] }
+                            { $multiply: [{ $ifNull: ['$views', 0] }, TRENDING_VIEWS_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, TRENDING_VOTES_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, TRENDING_COMMENTS_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, TRENDING_REWARD_WEIGHT] }
                         ]
                     }
                 }
@@ -1592,16 +1597,16 @@ app.get('/feeds/trendingSorted', async (req, res) => {
                 $addFields: {
                     base_score: {
                         $add: [
-                            { $multiply: [{ $ifNull: ['$views', 0] }, 1] },
-                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, 2] },
-                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, 3] },
-                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, 10] }
+                            { $multiply: [{ $ifNull: ['$views', 0] }, TRENDING_VIEWS_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, TRENDING_VOTES_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, TRENDING_COMMENTS_WEIGHT] },
+                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, TRENDING_REWARD_WEIGHT] }
                         ]
                     }
                 }
             },
             { $sort: { base_score: -1 } },
-            { $limit: 200 }
+            { $limit: TRENDING_CANDIDATE_LIMIT }
         ]).toArray();
 
         // Look up embed-video records to get Hive permlinks for reshare matching
