@@ -16,6 +16,7 @@ const HIVE_RPC_ENDPOINTS = (process.env.HIVE_RPC_ENDPOINTS || process.env.HIVE_R
     .split(',').map(s => s.trim()).filter(Boolean);
 const REWARD_WEIGHT = parseFloat(process.env.REWARD_WEIGHT) || 0.7; // weight for reward vs random (0-1, higher = more reward influence)
 const RESHARE_WEIGHT = parseFloat(process.env.RESHARE_WEIGHT) || 0.15; // weight for reshare influence (taken from random portion)
+const TRENDING_RESHARE_WEIGHT = parseFloat(process.env.TRENDING_RESHARE_WEIGHT) || 5; // weight for reshares in trending score
 
 // Middleware
 app.use(cors());
@@ -420,7 +421,7 @@ async function calculateAndFlagTrendingVideos() {
                 $limit: 50
             }
         ]).toArray();
-        
+
         // Flag the top 50 as trending
         if (trendingVideos.length > 0) {
             const trendingIds = trendingVideos.map(v => v._id);
@@ -1211,12 +1212,19 @@ app.get('/shortssorted', async (req, res) => {
         // so performance is independent of how large the user's total watch history is.
         if (currentuser) {
             const watchHistoryCollection = db.collection('watch_history');
-            const idsToCheck = sortedShorts.map(s => `${currentuser}:${s.owner}:${s.permlink}`);
+            const getHivePermlink = (s) => {
+                if (s.embed_url) {
+                    const parts = s.embed_url.replace(/^@/, '').split('/');
+                    if (parts.length === 2) return parts[1];
+                }
+                return s.permlink;
+            };
+            const idsToCheck = sortedShorts.map(s => `${currentuser}:${s.owner}:${getHivePermlink(s)}`);
             const watchedEntries = await watchHistoryCollection
                 .find({ _id: { $in: idsToCheck } }, { projection: { _id: 1 } })
                 .toArray();
             const watchedSet = new Set(watchedEntries.map(w => w._id));
-            sortedShorts = sortedShorts.filter(s => !watchedSet.has(`${currentuser}:${s.owner}:${s.permlink}`));
+            sortedShorts = sortedShorts.filter(s => !watchedSet.has(`${currentuser}:${s.owner}:${getHivePermlink(s)}`));
         }
 
         // Apply pagination to sorted results
@@ -1286,6 +1294,42 @@ app.get('/shortssorted', async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching sorted shorts:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to list embed-audio entries
+app.get('/audio', async (req, res) => {
+    try {
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const audioCollection = db.collection('embed-audio');
+
+        const total = await audioCollection.countDocuments();
+        const totalPages = Math.ceil(total / limit);
+
+        const audio = await audioCollection
+            .find()
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+
+        res.json({
+            success: true,
+            page,
+            limit,
+            total,
+            totalPages,
+            audio
+        });
+    } catch (error) {
+        console.error('Error fetching audio list:', error);
         res.status(500).json({
             success: false,
             error: 'Internal server error'
@@ -1519,6 +1563,112 @@ app.get('/feeds/trending', async (req, res) => {
     } catch (error) {
         console.error('Error fetching trending feed:', error);
         res.status(500).json({ 
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get trending feed sorted by score with reshare influence
+app.get('/feeds/trendingSorted', async (req, res) => {
+    try {
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+        // Fetch candidate videos with base score
+        const candidateVideos = await videosCollection.aggregate([
+            {
+                $match: {
+                    status: 'published',
+                    owner: { $ne: 'threespeak-fixer' },
+                    created: { $gte: sevenDaysAgo }
+                }
+            },
+            {
+                $addFields: {
+                    base_score: {
+                        $add: [
+                            { $multiply: [{ $ifNull: ['$views', 0] }, 1] },
+                            { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, 2] },
+                            { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, 3] },
+                            { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, 10] }
+                        ]
+                    }
+                }
+            },
+            { $sort: { base_score: -1 } },
+            { $limit: 200 }
+        ]).toArray();
+
+        // Look up embed-video records to get Hive permlinks for reshare matching
+        const embedVideoCollection = db.collection('embed-video');
+        const embedDocs = candidateVideos.length > 0
+            ? await embedVideoCollection.find(
+                { $or: candidateVideos.map(v => ({ owner: v.owner, permlink: v.permlink })) },
+                { projection: { owner: 1, permlink: 1, embed_url: 1 } }
+              ).toArray()
+            : [];
+
+        // Build map: "owner/shortPermlink" -> hive permlink from embed_url
+        const hivePermlinkMap = new Map();
+        for (const doc of embedDocs) {
+            if (doc.embed_url) {
+                const parts = doc.embed_url.replace(/^@/, '').split('/');
+                if (parts.length === 2) {
+                    hivePermlinkMap.set(`${doc.owner}/${doc.permlink}`, { author: parts[0], permlink: parts[1] });
+                }
+            }
+        }
+
+        // Fetch reshare counts for candidates
+        const reshareCountMap = new Map();
+        const reshareOrConditions = candidateVideos
+            .map(v => hivePermlinkMap.get(`${v.owner}/${v.permlink}`))
+            .filter(Boolean);
+
+        if (reshareOrConditions.length > 0) {
+            const resharesCollection = db.collection('reshares');
+            const reshareCounts = await resharesCollection.aggregate([
+                { $match: { $or: reshareOrConditions } },
+                { $group: { _id: { author: "$author", permlink: "$permlink" }, count: { $sum: 1 } } }
+            ]).toArray();
+            for (const rc of reshareCounts) {
+                reshareCountMap.set(`${rc._id.author}/${rc._id.permlink}`, rc.count);
+            }
+        }
+
+        // Compute final trending score including reshares
+        for (const video of candidateVideos) {
+            const hivePl = hivePermlinkMap.get(`${video.owner}/${video.permlink}`);
+            const reshareCount = hivePl ? (reshareCountMap.get(`${hivePl.author}/${hivePl.permlink}`) || 0) : 0;
+            video.reshare_count = reshareCount;
+            video.trending_score = video.base_score + reshareCount * TRENDING_RESHARE_WEIGHT;
+        }
+
+        // Sort by final score
+        candidateVideos.sort((a, b) => b.trending_score - a.trending_score);
+
+        const total = candidateVideos.length;
+        const totalPages = Math.ceil(total / limit);
+        const videos = candidateVideos.slice(skip, skip + limit);
+
+        res.json({
+            success: true,
+            feed: 'trendingSorted',
+            page,
+            limit,
+            total,
+            totalPages,
+            videos
+        });
+
+    } catch (error) {
+        console.error('Error fetching trendingSorted feed:', error);
+        res.status(500).json({
             success: false,
             error: 'Internal server error'
         });
