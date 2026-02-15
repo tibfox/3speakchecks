@@ -340,7 +340,7 @@ function setCachedFollowing(username, following) {
     followingCache.set(username, { following, timestamp: Date.now() });
 }
 
-// Fetch following list from Hive API
+// Fetch following list from Hive RPC API (condenser_api.get_following)
 async function getFollowingList(username) {
     // Check cache first
     const cached = getCachedFollowing(username);
@@ -349,22 +349,38 @@ async function getFollowingList(username) {
     }
 
     try {
-        const response = await fetch(
-            `https://api.hive.blog/hafsql/accounts/${username}/following?limit=1000`,
-            { 
-                headers: { 'accept': 'application/json' },
-                timeout: 5000 // 5 second timeout
-            }
-        );
+        const following = [];
+        let startFollowing = '';
+        const batchSize = 1000;
 
-        if (!response.ok) {
-            console.warn(`Failed to fetch following list for ${username}: ${response.status}`);
-            return null;
+        // Paginate through the full following list
+        while (true) {
+            const result = await hiveRpcBatch([{
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'condenser_api.get_following',
+                params: [username, startFollowing, 'blog', batchSize]
+            }]);
+
+            if (!result || result.length === 0 || !result[0].result) {
+                break;
+            }
+
+            const batch = result[0].result;
+            if (batch.length === 0) break;
+
+            for (const entry of batch) {
+                // Skip the startFollowing duplicate on subsequent pages
+                if (entry.following === startFollowing) continue;
+                following.push(entry.following);
+            }
+
+            // If we got fewer than batchSize, we've reached the end
+            if (batch.length < batchSize) break;
+            startFollowing = batch[batch.length - 1].following;
         }
 
-        const following = await response.json();
-        
-        if (!Array.isArray(following) || following.length === 0) {
+        if (following.length === 0) {
             console.log(`User ${username} follows nobody or following list is empty`);
             return null;
         }
