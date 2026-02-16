@@ -723,9 +723,10 @@ app.get('/videos/tag/:tag', async (req, res) => {
         // Query the videos collection
         const videosCollection = db.collection('videos');
         
-        // Build query to find videos with the tag in tags_v2 array
-        const query = { 
-            tags_v2: tag.toLowerCase()
+        // Build query to find published videos with the tag in tags_v2 array
+        const query = {
+            tags_v2: tag.toLowerCase(),
+            status: 'published'
         };
 
         // Get total count for pagination
@@ -783,10 +784,11 @@ app.get('/feed/:username', async (req, res) => {
 
         // If following list exists and has users, filter by them
         if (followingList && followingList.length > 0) {
-            query = { owner: { $in: followingList } };
+            query = { owner: { $in: followingList }, status: 'published' };
             console.log(`Fetching feed for ${username}: ${followingList.length} following`);
         } else {
-            // Fallback: return all videos
+            // Fallback: return all published videos
+            query = { status: 'published' };
             console.log(`Feed fallback for ${username}: showing all videos (no following list)`);
             feedType = 'all';
         }
