@@ -475,6 +475,7 @@ app.get('/', (req, res) => {
             feed: 'GET /feed/:username?page={page}&limit={limit}',
             shorts: 'GET /shorts?page={page}&limit={limit}&app={frontend_app}',
             shortsSorted: 'GET /shortssorted?page={page}&limit={limit}&app={frontend_app}&seed={seed}&currentuser={username}',
+            shortsStories: 'GET /shorts/stories?currentuser={username}&app={frontend_app}',
             updateThumbnail: 'PUT /video/thumbnail (Protected - requires API key)',
             feedRecommended: 'GET /feeds/recommended?page={page}&limit={limit}',
             feedNew: 'GET /feeds/new?page={page}&limit={limit}',
@@ -960,6 +961,124 @@ app.get('/shorts', async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching shorts:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Endpoint to get shorts "stories" — creators with unseen shorts in the past 7 days, grouped by creator
+// Returns a list of creators with their unseen short count, plus whether the current user posted a short recently
+app.get('/shorts/stories', async (req, res) => {
+    try {
+        const currentuser = req.query.currentuser; // optional: logged-in user
+        const appFilter = req.query.app; // optional frontend_app filter
+
+        const embedVideoCollection = db.collection('embed-video');
+
+        // Fetch published shorts from last 7 days
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+        const query = {
+            short: true,
+            status: 'published',
+            processed: true,
+            embed_url: { $exists: true, $ne: null },
+            createdAt: { $gte: sevenDaysAgo }
+        };
+
+        if (appFilter) {
+            query.frontend_app = appFilter;
+        }
+
+        const shortsData = await embedVideoCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        // Deduplicate: keep only the most recent short per owner+thumbnail
+        const seenVideos = new Map();
+        const deduplicatedShorts = [];
+        for (const short of shortsData) {
+            const dedupeKey = `${short.owner}|${short.thumbnail_url || 'no-thumb'}`;
+            if (!seenVideos.has(dedupeKey) || !short.thumbnail_url) {
+                seenVideos.set(dedupeKey, short);
+                deduplicatedShorts.push(short);
+            }
+        }
+
+        // Filter out low-reputation authors (reuse cached reputation data)
+        const filteredShorts = deduplicatedShorts.filter(short => {
+            if (short.embed_url) {
+                const parts = short.embed_url.replace(/^@/, '').split('/');
+                const cachedRep = reputationCache.get(parts[0]);
+                if (cachedRep && cachedRep.reputation <= 15) return false;
+            }
+            return true;
+        });
+
+        // If currentuser is provided, filter out shorts the user has already watched
+        let unwatchedShorts = filteredShorts;
+        if (currentuser) {
+            const watchHistoryCollection = db.collection('watch_history');
+            const getHivePermlink = (s) => {
+                if (s.embed_url) {
+                    const parts = s.embed_url.replace(/^@/, '').split('/');
+                    if (parts.length === 2) return parts[1];
+                }
+                return s.permlink;
+            };
+            const idsToCheck = filteredShorts.map(s => `${currentuser}:${s.owner}:${getHivePermlink(s)}`);
+            const watchedEntries = await watchHistoryCollection
+                .find({ _id: { $in: idsToCheck } }, { projection: { _id: 1 } })
+                .toArray();
+            const watchedSet = new Set(watchedEntries.map(w => w._id));
+            unwatchedShorts = filteredShorts.filter(s => !watchedSet.has(`${currentuser}:${s.owner}:${getHivePermlink(s)}`));
+        }
+
+        // Group by creator and count unseen shorts
+        const creatorMap = new Map();
+        for (const short of unwatchedShorts) {
+            if (!creatorMap.has(short.owner)) {
+                creatorMap.set(short.owner, { username: short.owner, unseen_count: 0 });
+            }
+            creatorMap.get(short.owner).unseen_count++;
+        }
+
+        // Sort creators by unseen_count descending
+        const creators = [...creatorMap.values()].sort((a, b) => b.unseen_count - a.unseen_count);
+
+        // Check if currentuser has posted a short in the last 7 days + get following list
+        let currentUserHasShort = false;
+        if (currentuser) {
+            const [userShort, followingList] = await Promise.all([
+                embedVideoCollection.findOne({
+                    short: true,
+                    status: 'published',
+                    owner: currentuser,
+                    createdAt: { $gte: sevenDaysAgo }
+                }),
+                getFollowingList(currentuser)
+            ]);
+            currentUserHasShort = !!userShort;
+
+            // Mark each creator with followed status
+            const followingSet = new Set(followingList || []);
+            for (const creator of creators) {
+                creator.followed = followingSet.has(creator.username);
+            }
+        }
+
+        res.json({
+            success: true,
+            currentUserHasShort,
+            creators
+        });
+
+    } catch (error) {
+        console.error('Error fetching shorts stories:', error);
         res.status(500).json({
             success: false,
             error: 'Internal server error'
