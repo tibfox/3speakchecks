@@ -1520,6 +1520,76 @@ app.get('/audio', async (req, res) => {
     }
 });
 
+// Endpoint to get video details (reusable flag) from MongoDB
+// Supports both 3speak permlink and Hive permlink (via embed_url fallback)
+app.get('/api/video/:owner/:permlink', async (req, res) => {
+    try {
+        const { owner, permlink } = req.params;
+        const videosCollection = db.collection('videos');
+
+        // Try direct match (3speak permlink) first
+        let video = await videosCollection.findOne(
+            { owner, permlink },
+            { projection: { reusable: 1, _id: 0 } }
+        );
+
+        // Fallback: try matching by embed_url (Hive permlink)
+        if (!video) {
+            video = await videosCollection.findOne(
+                { owner, embed_url: { $regex: `@${owner}/${permlink}$` } },
+                { projection: { reusable: 1, _id: 0 } }
+            );
+        }
+
+        if (!video) {
+            return res.status(404).json({ success: false, error: 'Video not found' });
+        }
+
+        res.json({ success: true, reusable: video.reusable || false });
+    } catch (error) {
+        console.error('Error fetching video details:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// PATCH endpoint to set reusable flag on a video
+// Protected by UPLOAD_SECRET_TOKEN (same token the frontend uses for uploads)
+app.patch('/api/video/:owner/:permlink/reusable', async (req, res) => {
+    try {
+        // Validate token
+        const authHeader = req.headers.authorization;
+        const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+        const UPLOAD_SECRET_TOKEN = process.env.UPLOAD_SECRET_TOKEN;
+
+        if (!UPLOAD_SECRET_TOKEN || token !== UPLOAD_SECRET_TOKEN) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const { owner, permlink } = req.params;
+        const { reusable } = req.body;
+
+        if (typeof reusable !== 'boolean') {
+            return res.status(400).json({ success: false, error: 'reusable must be a boolean' });
+        }
+
+        const videosCollection = db.collection('videos');
+        const result = await videosCollection.updateOne(
+            { owner, permlink },
+            { $set: { reusable } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ success: false, error: 'Video not found' });
+        }
+
+        console.log(`[PATCH reusable] ${owner}/${permlink} → reusable=${reusable}`);
+        res.json({ success: true, reusable });
+    } catch (error) {
+        console.error('Error updating reusable flag:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Endpoint to get batch video view counts
 app.post('/views', async (req, res) => {
     try {
@@ -1667,7 +1737,7 @@ app.get('/feeds/new', async (req, res) => {
         // Query for new content (exclude first uploads and trending)
         const query = {
             status: 'published',
-            owner: { $ne: 'threespeak-fixer' },
+            owner: { $nin: ['threespeak-fixer', 'eddiespinod', 'badadib'] },
             firstUpload: { $ne: true },
             trending: { $ne: true },
             publishFailed: { $ne: true }
@@ -1680,7 +1750,7 @@ app.get('/feeds/new', async (req, res) => {
                 status: 'published',
                 short: false,
                 listed_on_3speak: true,
-                hive_author: { $ne: null },
+                hive_author: { $nin: [null, 'eddiespinod', 'badadib'] },
                 hive_permlink: { $ne: null }
             }).sort({ createdAt: -1 }).limit(limit + skip).toArray()
         ]);
