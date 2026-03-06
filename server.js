@@ -22,6 +22,8 @@ const TRENDING_COMMENTS_WEIGHT = parseFloat(process.env.TRENDING_COMMENTS_WEIGHT
 const TRENDING_REWARD_WEIGHT = parseFloat(process.env.TRENDING_REWARD_WEIGHT) || 10;
 const TRENDING_RESHARE_WEIGHT = parseFloat(process.env.TRENDING_RESHARE_WEIGHT) || 5;
 const TRENDING_CANDIDATE_LIMIT = parseInt(process.env.TRENDING_CANDIDATE_LIMIT) || 200;
+const HIDDEN_AUTHORS = (process.env.HIDDEN_AUTHORS || 'threespeak-fixer')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
 // Middleware
 app.use(cors());
@@ -419,7 +421,7 @@ async function calculateAndFlagTrendingVideos() {
             {
                 $match: {
                     status: 'published',
-                    owner: { $ne: 'threespeak-fixer' },
+                    owner: { $nin: HIDDEN_AUTHORS },
                     created: { $gte: sevenDaysAgo }
                 }
             },
@@ -888,7 +890,8 @@ app.get('/shorts', async (req, res) => {
             status: 'published',
             processed: true,
             embed_url: { $exists: true, $ne: null },
-            createdAt: { $gte: sevenDaysAgo }
+            createdAt: { $gte: sevenDaysAgo },
+            owner: { $nin: HIDDEN_AUTHORS }
         };
 
         // Add optional app filter
@@ -986,7 +989,8 @@ app.get('/shorts/stories', async (req, res) => {
             status: 'published',
             processed: true,
             embed_url: { $exists: true, $ne: null },
-            createdAt: { $gte: sevenDaysAgo }
+            createdAt: { $gte: sevenDaysAgo },
+            owner: { $nin: HIDDEN_AUTHORS }
         };
 
         if (appFilter) {
@@ -1237,7 +1241,8 @@ app.get('/shortssorted', async (req, res) => {
                 status: 'published',
                 processed: true,
                 embed_url: { $exists: true, $ne: null },
-                createdAt: { $gte: fourteenDaysAgo }
+                createdAt: { $gte: fourteenDaysAgo },
+                owner: { $nin: HIDDEN_AUTHORS }
             };
 
             // Add optional app filter
@@ -1688,7 +1693,7 @@ app.get('/feeds/recommended', async (req, res) => {
         const query = { 
             recommended: true,
             status: 'published',
-            owner: { $ne: 'threespeak-fixer' }
+            owner: { $nin: HIDDEN_AUTHORS }
         };
 
         // Get total count for pagination
@@ -1737,7 +1742,7 @@ app.get('/feeds/new', async (req, res) => {
         // Query for new content (exclude first uploads and trending)
         const query = {
             status: 'published',
-            owner: { $nin: ['threespeak-fixer', 'eddiespinod', 'badadib'] },
+            owner: { $nin: HIDDEN_AUTHORS },
             firstUpload: { $ne: true },
             trending: { $ne: true },
             publishFailed: { $ne: true }
@@ -1750,7 +1755,7 @@ app.get('/feeds/new', async (req, res) => {
                 status: 'published',
                 short: false,
                 listed_on_3speak: true,
-                hive_author: { $nin: [null, 'eddiespinod', 'badadib'] },
+                hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
                 hive_permlink: { $ne: null }
             }).sort({ createdAt: -1 }).limit(limit + skip).toArray()
         ]);
@@ -1836,7 +1841,7 @@ app.get('/feeds/trending', async (req, res) => {
         const query = { 
             trending: true,
             status: 'published',
-            owner: { $ne: 'threespeak-fixer' }
+            owner: { $nin: HIDDEN_AUTHORS }
         };
 
         // Get total count for pagination
@@ -1888,7 +1893,7 @@ app.get('/feeds/trendingSorted', async (req, res) => {
                 {
                     $match: {
                         status: 'published',
-                        owner: { $ne: 'threespeak-fixer' },
+                        owner: { $nin: HIDDEN_AUTHORS },
                         publishFailed: { $ne: true },
                         created: { $gte: sevenDaysAgo }
                     }
@@ -2077,7 +2082,7 @@ app.get('/feeds/firstUploads', async (req, res) => {
         const query = {
             firstUpload: true,
             status: 'published',
-            owner: { $ne: 'threespeak-fixer' },
+            owner: { $nin: HIDDEN_AUTHORS },
             trending: { $ne: true },
             publishFailed: { $ne: true }
         };
