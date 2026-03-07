@@ -25,6 +25,26 @@ const TRENDING_CANDIDATE_LIMIT = parseInt(process.env.TRENDING_CANDIDATE_LIMIT) 
 const HIDDEN_AUTHORS = (process.env.HIDDEN_AUTHORS || 'threespeak-fixer')
     .split(',').map(s => s.trim()).filter(Boolean);
 
+// Content filter helpers
+// Banned filter - always applied
+const BANNED_FILTER = { banned: { $ne: true } };
+// NSFW filter - controlled by ?nsfw=true query param (default: filtered)
+function isNsfwAllowed(req) {
+    return req.query.nsfw === 'true';
+}
+function nsfwFilter(req) {
+    if (isNsfwAllowed(req)) return { ...BANNED_FILTER };
+    return { ...BANNED_FILTER, isNsfwContent: { $ne: true } };
+}
+function nsfwFilterTags(req) {
+    if (isNsfwAllowed(req)) return { ...BANNED_FILTER };
+    return { ...BANNED_FILTER, tags_v2: { $nin: ['nsfw'] }, isNsfwContent: { $ne: true } };
+}
+function nsfwFilterHiveTags(req) {
+    if (isNsfwAllowed(req)) return { ...BANNED_FILTER };
+    return { ...BANNED_FILTER, hive_tags: { $nin: ['nsfw', 'NSFW'] }, isNsfwContent: { $ne: true } };
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -421,6 +441,7 @@ async function calculateAndFlagTrendingVideos() {
             {
                 $match: {
                     status: 'published',
+                    ...BANNED_FILTER,
                     owner: { $nin: HIDDEN_AUTHORS },
                     created: { $gte: sevenDaysAgo }
                 }
@@ -639,14 +660,14 @@ app.get('/api/my-videos', async (req, res) => {
 
         // Build query for videos collection (legacy uploads)
         const videosCollection = db.collection('videos');
-        const query = { owner: username, publishFailed: { $ne: true } };
+        const query = { owner: username, publishFailed: { $ne: true }, ...BANNED_FILTER };
         if (statusFilter !== 'all') {
             query.status = statusFilter;
         }
 
         // Build query for embed-video collection (embed uploads, non-shorts only)
         const embedVideoCollection = db.collection('embed-video');
-        const embedQuery = { owner: username, short: false, listed_on_3speak: true };
+        const embedQuery = { owner: username, short: false, listed_on_3speak: true, ...BANNED_FILTER };
         if (statusFilter !== 'all') {
             embedQuery.status = statusFilter;
         }
@@ -771,7 +792,7 @@ app.get('/videos/tag/:tag', async (req, res) => {
         const query = {
             tags_v2: tag.toLowerCase(),
             status: 'published',
-            isNsfwContent: { $ne: true }
+            ...nsfwFilter(req)
         };
 
         // Get total count for pagination
@@ -829,11 +850,11 @@ app.get('/feed/:username', async (req, res) => {
 
         // If following list exists and has users, filter by them
         if (followingList && followingList.length > 0) {
-            query = { owner: { $in: followingList }, status: 'published', tags_v2: { $nin: ['nsfw'] }, isNsfwContent: { $ne: true } };
+            query = { owner: { $in: followingList }, status: 'published', ...nsfwFilterTags(req) };
             console.log(`Fetching feed for ${username}: ${followingList.length} following`);
         } else {
             // Fallback: return all published videos
-            query = { status: 'published', tags_v2: { $nin: ['nsfw'] }, isNsfwContent: { $ne: true } };
+            query = { status: 'published', ...nsfwFilterTags(req) };
             console.log(`Feed fallback for ${username}: showing all videos (no following list)`);
             feedType = 'all';
         }
@@ -893,8 +914,7 @@ app.get('/shorts', async (req, res) => {
             embed_url: { $exists: true, $ne: null },
             createdAt: { $gte: sevenDaysAgo },
             owner: { $nin: HIDDEN_AUTHORS },
-            hive_tags: { $nin: ['nsfw', 'NSFW'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterHiveTags(req)
         };
 
         // Add optional app filter
@@ -994,8 +1014,7 @@ app.get('/shorts/stories', async (req, res) => {
             embed_url: { $exists: true, $ne: null },
             createdAt: { $gte: sevenDaysAgo },
             owner: { $nin: HIDDEN_AUTHORS },
-            hive_tags: { $nin: ['nsfw', 'NSFW'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterHiveTags(req)
         };
 
         if (appFilter) {
@@ -1117,8 +1136,7 @@ app.get('/shorts/:username', async (req, res) => {
             processed: true,
             embed_url: { $exists: true, $ne: null },
             owner: username,
-            hive_tags: { $nin: ['nsfw', 'NSFW'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterHiveTags(req)
         };
 
         const [total, shortsData] = await Promise.all([
@@ -1250,8 +1268,7 @@ app.get('/shortssorted', async (req, res) => {
                 embed_url: { $exists: true, $ne: null },
                 createdAt: { $gte: fourteenDaysAgo },
                 owner: { $nin: HIDDEN_AUTHORS },
-                hive_tags: { $nin: ['nsfw', 'NSFW'] },
-                isNsfwContent: { $ne: true }
+                ...nsfwFilterHiveTags(req)
             };
 
             // Add optional app filter
@@ -1508,7 +1525,7 @@ app.get('/audio', async (req, res) => {
         const audioCollection = db.collection('embed-audio');
 
         const audioQuery = {
-            isNsfwContent: { $ne: true }
+            ...nsfwFilter(req)
         };
 
         const total = await audioCollection.countDocuments(audioQuery);
@@ -1707,8 +1724,7 @@ app.get('/feeds/recommended', async (req, res) => {
             recommended: true,
             status: 'published',
             owner: { $nin: HIDDEN_AUTHORS },
-            tags_v2: { $nin: ['nsfw'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterTags(req)
         };
 
         // Get total count for pagination
@@ -1761,8 +1777,7 @@ app.get('/feeds/new', async (req, res) => {
             firstUpload: { $ne: true },
             trending: { $ne: true },
             publishFailed: { $ne: true },
-            tags_v2: { $nin: ['nsfw'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterTags(req)
         };
 
         // Fetch legacy and embed videos in parallel
@@ -1774,8 +1789,7 @@ app.get('/feeds/new', async (req, res) => {
                 listed_on_3speak: true,
                 hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
                 hive_permlink: { $ne: null },
-                hive_tags: { $nin: ['nsfw', 'NSFW'] },
-                isNsfwContent: { $ne: true }
+                ...nsfwFilterHiveTags(req)
             }).sort({ createdAt: -1 }).limit(limit + skip).toArray()
         ]);
 
@@ -1861,8 +1875,7 @@ app.get('/feeds/trending', async (req, res) => {
             trending: true,
             status: 'published',
             owner: { $nin: HIDDEN_AUTHORS },
-            tags_v2: { $nin: ['nsfw'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterTags(req)
         };
 
         // Get total count for pagination
@@ -1917,8 +1930,7 @@ app.get('/feeds/trendingSorted', async (req, res) => {
                         owner: { $nin: HIDDEN_AUTHORS },
                         publishFailed: { $ne: true },
                         created: { $gte: sevenDaysAgo },
-                        tags_v2: { $nin: ['nsfw'] },
-                        isNsfwContent: { $ne: true }
+                        ...nsfwFilterTags(req)
                     }
                 },
                 {
@@ -1944,8 +1956,7 @@ app.get('/feeds/trendingSorted', async (req, res) => {
                 hive_author: { $ne: null },
                 hive_permlink: { $ne: null },
                 createdAt: { $gte: sevenDaysAgo },
-                hive_tags: { $nin: ['nsfw', 'NSFW'] },
-                isNsfwContent: { $ne: true }
+                ...nsfwFilterHiveTags(req)
             }).sort({ createdAt: -1 }).limit(TRENDING_CANDIDATE_LIMIT).toArray()
         ]);
 
@@ -2110,8 +2121,7 @@ app.get('/feeds/firstUploads', async (req, res) => {
             owner: { $nin: HIDDEN_AUTHORS },
             trending: { $ne: true },
             publishFailed: { $ne: true },
-            tags_v2: { $nin: ['nsfw'] },
-            isNsfwContent: { $ne: true }
+            ...nsfwFilterTags(req)
         };
 
         // Fetch legacy first uploads and embed videos in parallel
@@ -2123,8 +2133,7 @@ app.get('/feeds/firstUploads', async (req, res) => {
                 listed_on_3speak: true,
                 hive_author: { $ne: null },
                 hive_permlink: { $ne: null },
-                hive_tags: { $nin: ['nsfw', 'NSFW'] },
-                isNsfwContent: { $ne: true }
+                ...nsfwFilterHiveTags(req)
             }).sort({ createdAt: -1 }).limit(200).toArray()
         ]);
 
