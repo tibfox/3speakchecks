@@ -1,7 +1,32 @@
 const { MongoClient } = require('mongodb');
 const { MONGODB_URI, DATABASE_NAME } = require('./config');
+const searchWeights = require('../config/search-weights.json');
 
 let db;
+
+async function ensureTextIndex(collectionName, config) {
+    const col = db.collection(collectionName);
+    const fields = {};
+    const weights = {};
+    for (const [field, weight] of Object.entries(config.fields)) {
+        fields[field] = 'text';
+        weights[field] = weight;
+    }
+    const opts = { name: config.indexName, weights };
+    if (config.languageOverride) opts.language_override = config.languageOverride;
+
+    try {
+        await col.createIndex(fields, opts);
+    } catch (err) {
+        if (err.codeName === 'IndexOptionsConflict') {
+            console.log(`Recreating index ${config.indexName} with new weights...`);
+            await col.dropIndex(config.indexName);
+            await col.createIndex(fields, opts);
+        } else {
+            throw err;
+        }
+    }
+}
 
 async function connectToMongo() {
     try {
@@ -11,24 +36,11 @@ async function connectToMongo() {
         console.log('Connected to MongoDB successfully');
 
         // Create text indexes for search (non-blocking — may take a while on large collections)
-        Promise.all([
-            db.collection('videos').createIndex(
-                { title: 'text', description: 'text', tags_v2: 'text' },
-                { name: 'videos_text_search', language_override: '_text_lang' }
-            ),
-            db.collection('embed-video').createIndex(
-                { hive_title: 'text', hive_body: 'text', hive_tags: 'text' },
-                { name: 'embed_video_text_search' }
-            ),
-            db.collection('embed-audio').createIndex(
-                { title: 'text', description: 'text', tags: 'text' },
-                { name: 'embed_audio_text_search' }
-            ),
-            db.collection('hivecommunities').createIndex(
-                { title: 'text', about: 'text', description: 'text' },
-                { name: 'hivecommunities_text_search' }
-            ),
-        ]).then(() => console.log('Text search indexes ensured'))
+        Promise.all(
+            Object.values(searchWeights).map(config =>
+                ensureTextIndex(config.collection, config)
+            )
+        ).then(() => console.log('Text search indexes ensured'))
           .catch(err => console.error('Text index creation failed:', err.message));
     } catch (error) {
         console.error('Failed to connect to MongoDB:', error);

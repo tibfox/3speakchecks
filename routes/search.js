@@ -3,6 +3,67 @@ const router = express.Router();
 const { getDb } = require('../utils/db');
 const { nsfwFilter, nsfwFilterTags, nsfwFilterHiveTags } = require('../utils/filters');
 
+// Helper: highlight matched terms in a string
+function highlightMatches(text, terms) {
+    if (!text || !terms.length) return text;
+    const escaped = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
+    return text.replace(regex, '<mark>$1</mark>');
+}
+
+// GET /search/suggest — lightweight autocomplete
+router.get('/suggest', async (req, res) => {
+    try {
+        const db = getDb();
+        const q = (req.query.q || '').trim();
+        if (!q || q.length < 2) {
+            return res.json({ success: true, suggestions: [] });
+        }
+
+        const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const prefixRegex = { $regex: `^${escapedQ}`, $options: 'i' };
+        const containsRegex = { $regex: escapedQ, $options: 'i' };
+
+        const [titles, usernames, tags, communities] = await Promise.all([
+            db.collection('videos').find(
+                { title: containsRegex, status: 'published', publishFailed: { $ne: true } },
+                { projection: { title: 1, _id: 0 } }
+            ).limit(5).toArray(),
+            db.collection('hiveprofiles').find(
+                { $or: [{ username: prefixRegex }, { display_name: containsRegex }] },
+                { projection: { username: 1, display_name: 1, profile_image: 1, _id: 0 } }
+            ).limit(5).toArray(),
+            db.collection('videos').distinct('tags_v2', {
+                tags_v2: containsRegex,
+                status: 'published',
+                publishFailed: { $ne: true }
+            }).then(allTags => allTags
+                .map(t => typeof t === 'string' ? t.trim().replace(/^#/, '') : '')
+                .filter(t => t && new RegExp(escapedQ, 'i').test(t))
+                .filter((t, i, arr) => arr.indexOf(t) === i)
+                .slice(0, 5)
+            ),
+            db.collection('hivecommunities').find(
+                { $or: [{ name: prefixRegex }, { title: containsRegex }] },
+                { projection: { name: 1, title: 1, subscribers: 1, _id: 0 } }
+            ).sort({ subscribers: -1 }).limit(5).toArray()
+        ]);
+
+        const suggestions = [
+            ...titles.map(d => ({ type: 'title', text: d.title })),
+            ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
+            ...tags.map(t => ({ type: 'tag', text: t })),
+            ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', subscribers: d.subscribers || 0 }))
+        ];
+
+        res.json({ success: true, query: q, suggestions });
+    } catch (error) {
+        console.error('Suggest error:', error);
+        res.status(500).json({ success: false, error: 'Suggestion failed' });
+    }
+});
+
+// GET /search — full-text search
 router.get('/', async (req, res) => {
     try {
         const db = getDb();
@@ -13,34 +74,78 @@ router.get('/', async (req, res) => {
 
         const page = Math.max(parseInt(req.query.page) || 1, 1);
         const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
-        const type = req.query.type || 'all';
+        const typeParam = req.query.type || 'all';
+        const typeSet = typeParam === 'all' ? null : new Set(typeParam.split(',').map(t => t.trim()));
+        const wantType = (k) => !typeSet || typeSet.has(k);
+        const sort = req.query.sort === 'date' ? 'date' : 'relevance';
+
+        // Optional filters
+        const tagFilter = req.query.tag ? req.query.tag.trim().toLowerCase() : null;
+        const fromDate = req.query.from ? new Date(req.query.from) : null;
+        const toDate = req.query.to ? new Date(req.query.to) : null;
+        const communityFilter = req.query.community ? req.query.community.trim() : null;
+        const highlight = req.query.highlight !== 'false';
+
+        // Build date filter for MongoDB
+        const dateFilter = {};
+        if (fromDate && !isNaN(fromDate)) dateFilter.$gte = fromDate;
+        if (toDate && !isNaN(toDate)) dateFilter.$lte = toDate;
+        const hasDateFilter = Object.keys(dateFilter).length > 0;
+
+        // Search terms for highlighting
+        const searchTerms = q.split(/\s+/).filter(t => t.length > 0 && !t.startsWith('-') && !t.startsWith('"'));
 
         const textQuery = { $text: { $search: q } };
-        const scoreProj = { score: { $meta: 'textScore' } };
         const scoreSort = { score: { $meta: 'textScore' } };
+        const maxPerCollection = Math.max(limit * page * 3, 100);
 
         const searches = [];
 
+        // Helper: build extra filters for videos collection
+        function videoExtraFilters() {
+            const extra = {};
+            if (tagFilter) extra.tags_v2 = tagFilter;
+            if (hasDateFilter) extra.created = dateFilter;
+            if (communityFilter) extra.community = communityFilter;
+            return extra;
+        }
+
+        // Helper: build extra filters for embed-video collection
+        function embedExtraFilters() {
+            const extra = {};
+            if (tagFilter) extra.hive_tags = tagFilter;
+            if (hasDateFilter) extra.createdAt = dateFilter;
+            if (communityFilter) extra.community = communityFilter;
+            return extra;
+        }
+
+        // Helper: build extra filters for embed-audio collection
+        function audioExtraFilters() {
+            const extra = {};
+            if (hasDateFilter) extra.createdAt = dateFilter;
+            return extra;
+        }
+
         // Videos (non-embed, legacy)
-        if (type === 'all' || type === 'video') {
+        if (wantType('video')) {
             searches.push(
                 db.collection('videos').find({
                     ...textQuery,
                     status: 'published',
                     publishFailed: { $ne: true },
-                    ...nsfwFilterTags(req)
-                }, { projection: scoreProj })
-                .sort(scoreSort).limit(200).toArray()
+                    ...nsfwFilterTags(req),
+                    ...videoExtraFilters()
+                }, { projection: { score: { $meta: 'textScore' }, owner: 1, author: 1, permlink: 1, title: 1, created: 1, created_at: 1, createdAt: 1, duration: 1, tags_v2: 1, thumbnail: 1, images: 1, views: 1 } })
+                .sort(scoreSort).limit(maxPerCollection).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'video',
                     owner: d.owner,
                     author: d.author || d.owner,
                     permlink: d.permlink,
                     title: d.title || '',
-                    body: d.description || d.body || '',
                     created_at: d.created || d.created_at || d.createdAt,
                     duration: d.duration || 0,
-                    tags: d.tags_v2 || d.tags || [],
+                    tags: d.tags_v2 || [],
                     images: {
                         thumbnail: d.thumbnail || d.images?.thumbnail || `https://img.3speak.tv/${d.permlink}/thumbnail.png`,
                         poster: d.images?.poster || `https://img.3speak.tv/${d.permlink}/poster.jpg`
@@ -52,7 +157,7 @@ router.get('/', async (req, res) => {
         }
 
         // Embed videos (non-shorts)
-        if (type === 'all' || type === 'video') {
+        if (wantType('video')) {
             searches.push(
                 db.collection('embed-video').find({
                     ...textQuery,
@@ -61,16 +166,16 @@ router.get('/', async (req, res) => {
                     listed_on_3speak: true,
                     hive_author: { $ne: null },
                     hive_permlink: { $ne: null },
-                    ...nsfwFilterHiveTags(req)
-                }, { projection: scoreProj })
-                .sort(scoreSort).limit(200).toArray()
+                    ...nsfwFilterHiveTags(req),
+                    ...embedExtraFilters()
+                }, { projection: { score: { $meta: 'textScore' }, owner: 1, hive_author: 1, hive_permlink: 1, permlink: 1, hive_title: 1, originalFilename: 1, createdAt: 1, duration: 1, hive_tags: 1, thumbnail_url: 1, views: 1 } })
+                .sort(scoreSort).limit(maxPerCollection).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'video',
                     owner: d.owner,
                     author: d.hive_author || d.owner,
                     permlink: d.hive_permlink || d.permlink,
                     title: d.hive_title || d.originalFilename || '',
-                    body: d.hive_body || '',
                     created_at: d.createdAt,
                     duration: d.duration || 0,
                     tags: d.hive_tags || [],
@@ -85,7 +190,7 @@ router.get('/', async (req, res) => {
         }
 
         // Shorts (embed-video with short: true)
-        if (type === 'all' || type === 'short') {
+        if (wantType('short')) {
             searches.push(
                 db.collection('embed-video').find({
                     ...textQuery,
@@ -93,16 +198,16 @@ router.get('/', async (req, res) => {
                     short: true,
                     processed: true,
                     embed_url: { $exists: true, $ne: null },
-                    ...nsfwFilterHiveTags(req)
-                }, { projection: scoreProj })
-                .sort(scoreSort).limit(200).toArray()
+                    ...nsfwFilterHiveTags(req),
+                    ...embedExtraFilters()
+                }, { projection: { score: { $meta: 'textScore' }, owner: 1, hive_author: 1, permlink: 1, hive_title: 1, embed_title: 1, originalFilename: 1, createdAt: 1, duration: 1, hive_tags: 1, thumbnail_url: 1, embed_url: 1, views: 1, short: 1 } })
+                .sort(scoreSort).limit(maxPerCollection).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'short',
                     owner: d.owner,
                     author: d.hive_author || d.owner,
                     permlink: d.permlink,
                     title: d.hive_title || d.embed_title || d.originalFilename || '',
-                    body: d.hive_body || '',
                     created_at: d.createdAt,
                     duration: d.duration || 0,
                     tags: d.hive_tags || [],
@@ -118,19 +223,19 @@ router.get('/', async (req, res) => {
         }
 
         // Audio
-        if (type === 'all' || type === 'audio') {
+        if (wantType('audio')) {
             searches.push(
                 db.collection('embed-audio').find({
                     ...textQuery,
-                    ...nsfwFilter(req)
-                }, { projection: scoreProj })
-                .sort(scoreSort).limit(200).toArray()
+                    ...nsfwFilter(req),
+                    ...audioExtraFilters()
+                }, { projection: { score: { $meta: 'textScore' }, owner: 1, permlink: 1, title: 1, originalFilename: 1, createdAt: 1, duration: 1, tags: 1 } })
+                .sort(scoreSort).limit(maxPerCollection).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'audio',
                     owner: d.owner,
                     permlink: d.permlink,
                     title: d.title || d.originalFilename || '',
-                    body: d.description || '',
                     created_at: d.createdAt,
                     duration: d.duration || 0,
                     tags: d.tags ? (Array.isArray(d.tags) ? d.tags : d.tags.split(',').map(t => t.trim())) : [],
@@ -140,13 +245,13 @@ router.get('/', async (req, res) => {
         }
 
         // Communities
-        if (type === 'all' || type === 'community') {
+        if (wantType('community')) {
             searches.push(
                 db.collection('hivecommunities').find(
                     textQuery,
-                    { projection: scoreProj }
+                    { projection: { score: { $meta: 'textScore' }, name: 1, title: 1, about: 1, description: 1, subscribers: 1, num_authors: 1 } }
                 )
-                .sort(scoreSort).limit(50).toArray()
+                .sort(scoreSort).limit(maxPerCollection).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'community',
                     name: d.name,
@@ -160,8 +265,29 @@ router.get('/', async (req, res) => {
             );
         }
 
+        // User profiles
+        if (wantType('user')) {
+            searches.push(
+                db.collection('hiveprofiles').find(
+                    textQuery,
+                    { projection: { score: { $meta: 'textScore' }, username: 1, display_name: 1, about: 1, location: 1, profile_image: 1, cover_image: 1 } }
+                )
+                .sort(scoreSort).limit(maxPerCollection).toArray()
+                .then(docs => docs.map(d => ({
+                    type: 'user',
+                    username: d.username,
+                    display_name: d.display_name || '',
+                    about: d.about || '',
+                    location: d.location || '',
+                    profile_image: d.profile_image || '',
+                    cover_image: d.cover_image || '',
+                    score: d.score
+                })))
+            );
+        }
+
         // Subtitle-tags join: find videos matching by AI-generated tags
-        if (type === 'all' || type === 'video' || type === 'short') {
+        if (wantType('video') || wantType('short')) {
             const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             searches.push(
                 db.collection('subtitles-tags').find({
@@ -178,12 +304,12 @@ router.get('/', async (req, res) => {
                             status: 'published',
                             publishFailed: { $ne: true },
                             ...nsfwFilterTags(req)
-                        }).limit(50).toArray(),
+                        }, { projection: { owner: 1, author: 1, permlink: 1, title: 1, created: 1, created_at: 1, createdAt: 1, duration: 1, tags_v2: 1, thumbnail: 1, images: 1, views: 1 } }).limit(50).toArray(),
                         db.collection('embed-video').find({
                             $or: lookups.map(l => ({ owner: l.owner, permlink: l.permlink })),
                             status: 'published',
                             ...nsfwFilterHiveTags(req)
-                        }).limit(50).toArray()
+                        }, { projection: { owner: 1, hive_author: 1, hive_permlink: 1, permlink: 1, hive_title: 1, embed_title: 1, originalFilename: 1, createdAt: 1, duration: 1, hive_tags: 1, thumbnail_url: 1, embed_url: 1, views: 1, short: 1 } }).limit(50).toArray()
                     ]);
 
                     const results = [];
@@ -194,7 +320,6 @@ router.get('/', async (req, res) => {
                             author: d.author || d.owner,
                             permlink: d.permlink,
                             title: d.title || '',
-                            body: d.description || d.body || '',
                             created_at: d.created || d.created_at || d.createdAt,
                             duration: d.duration || 0,
                             tags: d.tags_v2 || d.tags || [],
@@ -213,7 +338,6 @@ router.get('/', async (req, res) => {
                             author: d.hive_author || d.owner,
                             permlink: d.short ? d.permlink : (d.hive_permlink || d.permlink),
                             title: d.hive_title || d.embed_title || d.originalFilename || '',
-                            body: d.hive_body || '',
                             created_at: d.createdAt,
                             duration: d.duration || 0,
                             tags: d.hive_tags || [],
@@ -233,15 +357,62 @@ router.get('/', async (req, res) => {
         // Execute all searches in parallel
         const allResults = (await Promise.all(searches)).flat();
 
-        // Deduplicate by owner+permlink+type (text search results take priority)
+        // Apply score modifiers
+        const now = Date.now();
+        for (const r of allResults) {
+            // Recency boost (sort=date)
+            if (sort === 'date' && r.created_at) {
+                const ageInDays = (now - new Date(r.created_at).getTime()) / (1000 * 60 * 60 * 24);
+                r.score = r.score * Math.max(0.3, 3 - (ageInDays / 30));
+            }
+            // Popularity boost: views give a mild multiplier (log scale, max ~1.5x)
+            if (r.views > 0) {
+                r.score = r.score * (1 + Math.min(Math.log10(r.views) / 10, 0.5));
+            }
+        }
+
+        // Filter by date range (client-side for subtitle-tag results that bypass mongo date filter)
+        let filtered = allResults;
+        if (hasDateFilter) {
+            filtered = allResults.filter(r => {
+                if (!r.created_at) return r.type === 'community' || r.type === 'user';
+                const d = new Date(r.created_at);
+                if (fromDate && !isNaN(fromDate) && d < fromDate) return false;
+                if (toDate && !isNaN(toDate) && d > toDate) return false;
+                return true;
+            });
+        }
+
+        // Filter by tag (client-side for subtitle-tag results)
+        if (tagFilter) {
+            filtered = filtered.filter(r => {
+                if (r.type === 'community' || r.type === 'user') return true;
+                if (!r.tags) return false;
+                return r.tags.some(t => (typeof t === 'string' ? t.toLowerCase() : '') === tagFilter);
+            });
+        }
+
+        // Deduplicate by type-specific key (text search results take priority via score sort)
         const seen = new Set();
         const deduped = [];
-        allResults.sort((a, b) => b.score - a.score);
-        for (const r of allResults) {
-            const key = `${r.type}:${r.owner}:${r.permlink}`;
+        filtered.sort((a, b) => b.score - a.score);
+        for (const r of filtered) {
+            let key;
+            if (r.type === 'user') key = `user:${r.username}`;
+            else if (r.type === 'community') key = `community:${r.name}`;
+            else key = `${r.type}:${r.owner}:${r.permlink}`;
             if (!seen.has(key)) {
                 seen.add(key);
                 deduped.push(r);
+            }
+        }
+
+        // Apply highlighting
+        if (highlight && searchTerms.length > 0) {
+            for (const r of deduped) {
+                r.title_highlighted = highlightMatches(r.title, searchTerms);
+                if (r.about !== undefined) r.about_highlighted = highlightMatches(r.about, searchTerms);
+                if (r.display_name !== undefined) r.display_name_highlighted = highlightMatches(r.display_name, searchTerms);
             }
         }
 
@@ -253,6 +424,14 @@ router.get('/', async (req, res) => {
         res.json({
             success: true,
             query: q,
+            sort,
+            filters: {
+                type: typeParam,
+                tag: tagFilter || undefined,
+                from: fromDate && !isNaN(fromDate) ? fromDate.toISOString() : undefined,
+                to: toDate && !isNaN(toDate) ? toDate.toISOString() : undefined,
+                community: communityFilter || undefined
+            },
             page,
             limit,
             total,

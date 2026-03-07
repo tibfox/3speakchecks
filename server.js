@@ -6,6 +6,7 @@ const { PORT } = require('./utils/config');
 const { connectToMongo } = require('./utils/db');
 const { calculateAndFlagTrendingVideos } = require('./services/trending');
 const { syncHiveCommunities } = require('./services/communitySync');
+const { syncHiveProfiles } = require('./services/profileSync');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -46,13 +47,16 @@ async function startServer() {
     });
     console.log('Trending calculation scheduled to run every 15 minutes');
 
-    // Sync communities on startup (non-blocking) and daily at 3 AM
+    // Sync communities and profiles on startup (non-blocking) and daily at 3 AM
     syncHiveCommunities();
+    syncHiveProfiles();
     cron.schedule('0 3 * * *', () => {
         console.log('Running scheduled community sync...');
         syncHiveCommunities();
+        console.log('Running scheduled profile sync...');
+        syncHiveProfiles();
     });
-    console.log('Community sync scheduled to run daily at 3 AM');
+    console.log('Community + profile sync scheduled to run daily at 3 AM');
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
