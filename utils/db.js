@@ -18,9 +18,16 @@ async function ensureTextIndex(collectionName, config) {
     try {
         await col.createIndex(fields, opts);
     } catch (err) {
-        if (err.codeName === 'IndexOptionsConflict') {
-            console.log(`Recreating index ${config.indexName} with new weights...`);
-            await col.dropIndex(config.indexName);
+        if (err.codeName === 'IndexOptionsConflict' || err.code === 85) {
+            console.log(`Recreating text index on ${collectionName}...`);
+            // Drop any existing text index (only one allowed per collection)
+            const indexes = await col.indexes();
+            for (const idx of indexes) {
+                if (idx.textIndexVersion) {
+                    await col.dropIndex(idx.name);
+                    break;
+                }
+            }
             await col.createIndex(fields, opts);
         } else {
             throw err;
