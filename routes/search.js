@@ -27,7 +27,7 @@ router.get('/suggest', async (req, res) => {
         const [titles, usernames, tags, communities] = await Promise.all([
             db.collection('videos').find(
                 { title: containsRegex, status: 'published', publishFailed: { $ne: true } },
-                { projection: { title: 1, _id: 0 } }
+                { projection: { title: 1, author: 1, owner: 1, permlink: 1, _id: 0 } }
             ).limit(5).toArray(),
             db.collection('hiveprofiles').find(
                 { $or: [{ username: prefixRegex }, { display_name: containsRegex }] },
@@ -61,7 +61,7 @@ router.get('/suggest', async (req, res) => {
         ]);
 
         const suggestions = [
-            ...titles.map(d => ({ type: 'title', text: d.title })),
+            ...titles.map(d => ({ type: 'title', text: d.title, author: d.author || d.owner || '', permlink: d.permlink || '' })),
             ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
             ...tags.map(t => ({ type: 'tag', text: t })),
             ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', subscribers: d.subscribers || 0 }))
