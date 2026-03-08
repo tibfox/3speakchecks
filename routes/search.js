@@ -33,16 +33,27 @@ router.get('/suggest', async (req, res) => {
                 { $or: [{ username: prefixRegex }, { display_name: containsRegex }] },
                 { projection: { username: 1, display_name: 1, profile_image: 1, _id: 0 } }
             ).limit(5).toArray(),
-            db.collection('videos').distinct('tags_v2', {
-                tags_v2: containsRegex,
-                status: 'published',
-                publishFailed: { $ne: true }
-            }).then(allTags => allTags
-                .map(t => typeof t === 'string' ? t.trim().replace(/^#/, '') : '')
-                .filter(t => t && new RegExp(escapedQ, 'i').test(t))
-                .filter((t, i, arr) => arr.indexOf(t) === i)
-                .slice(0, 5)
-            ),
+            db.collection('videos').find(
+                { tags_v2: containsRegex, status: 'published', publishFailed: { $ne: true } },
+                { projection: { tags_v2: 1, _id: 0 } }
+            ).limit(50).toArray().then(docs => {
+                const re = new RegExp(escapedQ, 'i');
+                const seen = new Set();
+                const result = [];
+                for (const d of docs) {
+                    if (!Array.isArray(d.tags_v2)) continue;
+                    for (const raw of d.tags_v2) {
+                        if (typeof raw !== 'string') continue;
+                        const t = raw.trim().replace(/^#/, '');
+                        if (t && re.test(t) && !seen.has(t.toLowerCase())) {
+                            seen.add(t.toLowerCase());
+                            result.push(t);
+                            if (result.length >= 5) return result;
+                        }
+                    }
+                }
+                return result;
+            }),
             db.collection('hivecommunities').find(
                 { $or: [{ name: prefixRegex }, { title: containsRegex }] },
                 { projection: { name: 1, title: 1, subscribers: 1, _id: 0 } }
