@@ -1,0 +1,54 @@
+{
+  "videos": {
+    "collection": "videos",
+    "indexName": "videos_text_search",
+    "languageOverride": "_text_lang",
+    "fields": {
+      "owner": 10,
+      "title": 10,
+      "community_title": 5,
+      "hive": 3,
+      "tags_v2": 5,
+      "description": 1
+    }
+  },
+  "embedVideo": {
+    "collection": "embed-video",
+    "indexName": "embed_video_text_search",
+    "fields": {
+      "owner": 10,
+      "hive_title": 10,
+      "hive_tags": 5,
+      "hive_body": 1
+    }
+  },
+  "embedAudio": {
+    "collection": "embed-audio",
+    "indexName": "embed_audio_text_search",
+    "fields": {
+      "owner": 10,
+      "title": 10,
+      "tags": 5,
+      "description": 1
+    }
+  },
+  "hivecommunities": {
+    "collection": "hivecommunities",
+    "indexName": "hivecommunities_text_search",
+    "fields": {
+      "title": 10,
+      "about": 5,
+      "description": 1
+    }
+  },
+  "hiveprofiles": {
+    "collection": "hiveprofiles",
+    "indexName": "hiveprofiles_text_search",
+    "fields": {
+      "username": 10,
+      "display_name": 10,
+      "location": 5,
+      "about": 3
+    }
+  }
+}
