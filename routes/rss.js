@@ -112,7 +112,7 @@ function buildItem(video, itunesAuthor) {
             { 'itunes:explicit': video.isNsfwContent ? 'yes' : 'clean' },
             { 'itunes:image': { _attr: { href: baseThumbUrl } } },
             {
-                'enclosure ': {
+                'enclosure': {
                     _attr: {
                         url: videoPlayUrl,
                         length: parseInt(video.size) || 0,
