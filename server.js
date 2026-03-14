@@ -17,12 +17,17 @@ const videosRoutes = require('./routes/videos');
 const shortsRoutes = require('./routes/shorts');
 const audioRoutes = require('./routes/audio');
 const feedsRoutes = require('./routes/feeds');
+const rssRoutes = require('./routes/rss');
 
 const app = express();
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Serve static files (XSL stylesheet for RSS feed viewer, etc.)
+app.use(express.static('public'));
+
 
 // Mount routes
 app.use('/', healthRoutes);
@@ -32,6 +37,7 @@ app.use('/', videosRoutes);
 app.use('/', shortsRoutes);
 app.use('/audio', audioRoutes);
 app.use('/feeds', feedsRoutes);
+app.use('/rss', rssRoutes);
 
 // Track whether heavy sync tasks are running
 let syncRunning = false;
