@@ -221,7 +221,7 @@ router.get('/trendingSorted', async (req, res) => {
         const embedVideoCollection = db.collection('embed-video');
         const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-        // Fetch legacy candidate videos with base score
+        // Fetch legacy candidate videos (without reward in base_score — reward will be fetched live from Hive)
         const [legacyCandidates, embedCandidatesRaw] = await Promise.all([
             videosCollection.aggregate([
                 {
@@ -239,8 +239,7 @@ router.get('/trendingSorted', async (req, res) => {
                             $add: [
                                 { $multiply: [{ $ifNull: ['$views', 0] }, TRENDING_VIEWS_WEIGHT] },
                                 { $multiply: [{ $ifNull: ['$stats.num_votes', 0] }, TRENDING_VOTES_WEIGHT] },
-                                { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, TRENDING_COMMENTS_WEIGHT] },
-                                { $multiply: [{ $ifNull: ['$stats.total_hive_reward', 0] }, TRENDING_REWARD_WEIGHT] }
+                                { $multiply: [{ $ifNull: ['$stats.num_comments', 0] }, TRENDING_COMMENTS_WEIGHT] }
                             ]
                         }
                     }
@@ -259,6 +258,24 @@ router.get('/trendingSorted', async (req, res) => {
                 ...nsfwFilterHiveTags(req)
             }).sort({ createdAt: -1 }).limit(TRENDING_CANDIDATE_LIMIT).toArray()
         ]);
+
+        // Enrich legacy videos with live Hive reward data (stats.total_hive_reward in MongoDB is unreliable)
+        const legacyAuthorPerms = legacyCandidates
+            .filter(v => (v.author || v.owner) && v.permlink)
+            .map(v => ({ author: v.author || v.owner, permlink: v.permlink }));
+
+        let legacyHiveData = new Map();
+        if (legacyAuthorPerms.length > 0) {
+            legacyHiveData = await fetchHiveRewards(legacyAuthorPerms);
+        }
+
+        // Recalculate base_score for legacy videos with live reward data
+        for (const video of legacyCandidates) {
+            const hiveKey = `${video.author || video.owner}/${video.permlink}`;
+            const hive = legacyHiveData.get(hiveKey);
+            const liveReward = hive ? (hive.reward || 0) : 0;
+            video.base_score = (video.base_score || 0) + liveReward * TRENDING_REWARD_WEIGHT;
+        }
 
         // Enrich embed videos with Hive data for scoring
         const embedAuthorPerms = embedCandidatesRaw
