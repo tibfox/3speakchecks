@@ -58,10 +58,11 @@ router.get('/suggest', async (req, res) => {
                 { $or: [{ name: prefixRegex }, { title: containsRegex }] },
                 { projection: { name: 1, title: 1, about: 1, subscribers: 1, num_authors: 1, _id: 0 } }
             ).sort({ subscribers: -1 }).limit(5).toArray(),
-            db.collection('playlists').find(
-                { access: 'public', name: { $ne: 'Watch Later' }, $or: [{ name: containsRegex }, { tags: containsRegex }] },
-                { projection: { _id: 1, name: 1, owner: 1, items: 1 } }
-            ).limit(5).toArray()
+            db.collection('playlists').aggregate([
+                { $match: { access: 'public', name: { $ne: 'Watch Later' }, $or: [{ name: containsRegex }, { tags: containsRegex }] } },
+                { $project: { _id: 1, name: 1, owner: 1, video_count: { $cond: { if: { $isArray: '$items' }, then: { $size: '$items' }, else: 0 } } } },
+                { $limit: 5 },
+            ]).toArray()
         ]);
 
         const suggestions = [
@@ -69,7 +70,7 @@ router.get('/suggest', async (req, res) => {
             ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
             ...tags.map(t => ({ type: 'tag', text: t })),
             ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', about: d.about || '', subscribers: d.subscribers || 0, num_authors: d.num_authors || 0 })),
-            ...playlists.map(d => ({ type: 'playlist', id: d._id, name: d.name || '', owner: d.owner || '', video_count: Array.isArray(d.items) ? d.items.length : 0 }))
+            ...playlists.map(d => ({ type: 'playlist', id: d._id, name: d.name || '', owner: d.owner || '', video_count: d.video_count || 0 }))
         ];
 
         res.json({ success: true, query: q, suggestions });
@@ -307,15 +308,12 @@ router.get('/', async (req, res) => {
             const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const playlistRegex = { $regex: escapedQ, $options: 'i' };
             searches.push(
-                db.collection('playlists').find({
-                    access: 'public',
-                    name: { $ne: 'Watch Later' },
-                    $or: [
-                        { name: playlistRegex },
-                        { tags: playlistRegex },
-                    ],
-                }, { projection: { _id: 1, name: 1, owner: 1, thumbnail: 1, tags: 1, items: 1, created_at: 1 } })
-                .sort({ created_at: -1 }).limit(maxPerCollection).toArray()
+                db.collection('playlists').aggregate([
+                    { $match: { access: 'public', name: { $ne: 'Watch Later' }, $or: [{ name: playlistRegex }, { tags: playlistRegex }] } },
+                    { $project: { _id: 1, name: 1, owner: 1, thumbnail: 1, tags: 1, created_at: 1, video_count: { $cond: { if: { $isArray: '$items' }, then: { $size: '$items' }, else: 0 } } } },
+                    { $sort: { created_at: -1 } },
+                    { $limit: maxPerCollection },
+                ]).toArray()
                 .then(docs => docs.map(d => ({
                     type: 'playlist',
                     id: d._id,
@@ -323,7 +321,7 @@ router.get('/', async (req, res) => {
                     owner: d.owner || '',
                     thumbnail: d.thumbnail || '',
                     tags: d.tags || [],
-                    video_count: Array.isArray(d.items) ? d.items.length : 0,
+                    video_count: d.video_count || 0,
                     created_at: d.created_at,
                     score: 1
                 })))

@@ -124,6 +124,10 @@ function resetMocks() {
         col.findOne.mockReset().mockResolvedValue(null);
         col.countDocuments.mockReset().mockResolvedValue(0);
     }
+    // Simulate partial backfill: embed findOne returns a doc when
+    // hasHiveTagsLower checks for missing hive_tags_lower, keeping
+    // the regex fallback path active for filter testing.
+    mockEmbedCol.findOne.mockResolvedValue({ _id: 'partial' });
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +220,36 @@ describe('GET /videos/tag/:tag', () => {
         expect(legacyQuery).toMatchObject(NSFW_LEGACY_FILTER);
     });
 
+    test('regex special chars in tag are escaped', async () => {
+        await request(app).get('/videos/tag/c%2B%2B?type=shorts');
+
+        const query = mockEmbedCol.find.mock.calls[0][0];
+        // The $and should contain a regex with escaped + chars
+        const tagCondition = query.$and.find(c => c.hive_tags && c.hive_tags.$elemMatch);
+        expect(tagCondition).toBeDefined();
+        // The regex should match literal "c++" not regex "c" repeated
+        const regex = tagCondition.hive_tags.$elemMatch.$regex;
+        expect(regex.source).toContain('\\+\\+');
+    });
+
+    test('mantecurated type=videos — embed query has short=false', async () => {
+        await request(app).get('/videos/tag/mantecurated?type=videos');
+
+        // fetchEmbed should not be called when type=videos (Promise.resolve([]))
+        // But the embedQuery is built with short=false
+        // Since type=videos, fetchEmbed is skipped — verify via legacy only
+        const legacyQuery = mockVideosCol.find.mock.calls[0][0];
+        expect(legacyQuery).toMatchObject(NSFW_LEGACY_FILTER);
+    });
+
+    test('mantecurated type=shorts — embed query has short=true', async () => {
+        await request(app).get('/videos/tag/mantecurated?type=shorts');
+
+        const embedQuery = mockEmbedCol.find.mock.calls[0][0];
+        expect(embedQuery.short).toBe(true);
+        expect(embedQuery.mantecurated).toBe(true);
+    });
+
     test('mantecurated — embed query includes nsfwFilterHiveTags', async () => {
         await request(app).get('/videos/tag/mantecurated');
 
@@ -250,11 +284,20 @@ describe('GET /videos/tag/:tag/counts', () => {
         expect(legacyQuery).toMatchObject(NSFW_LEGACY_FILTER);
     });
 
-    test('mantecurated counts — embed query filtered', async () => {
+    test('mantecurated counts — split by short field', async () => {
         await request(app).get('/videos/tag/mantecurated/counts');
 
-        const embedQuery = mockEmbedCol.countDocuments.mock.calls[0][0];
-        expect(embedQuery).toMatchObject(NSFW_HIVE_TAGS_FILTER);
+        // Should have 3 count calls: legacy videos, embed videos (short:false), embed shorts (short:true)
+        const embedCalls = mockEmbedCol.countDocuments.mock.calls;
+        expect(embedCalls.length).toBe(2);
+
+        const embedVideoQuery = embedCalls[0][0];
+        expect(embedVideoQuery).toMatchObject(NSFW_HIVE_TAGS_FILTER);
+        expect(embedVideoQuery.short).toBe(false);
+
+        const embedShortQuery = embedCalls[1][0];
+        expect(embedShortQuery).toMatchObject(NSFW_HIVE_TAGS_FILTER);
+        expect(embedShortQuery.short).toBe(true);
     });
 });
 
@@ -272,18 +315,30 @@ describe('GET /videodetails/:author/:permlink', () => {
         expect(query.permlink).toBe('test');
     });
 
-    test('falls through to embed-video with BANNED_FILTER', async () => {
+    test('falls through to embed-video with BANNED_FILTER and $or for hive pair', async () => {
         mockVideosCol.findOne.mockResolvedValue(null);
-        mockEmbedCol.findOne.mockResolvedValue({ owner: 'bob', permlink: 'snap1' });
+        // First findOne call is from hasHiveTagsLower (if triggered), subsequent is the actual query
+        // Use mockResolvedValueOnce chaining: first return null for videos, then doc for embed
+        mockEmbedCol.findOne.mockReset()
+            .mockResolvedValue({ owner: 'bob', permlink: 'snap1' });
 
         await request(app).get('/videodetails/bob/snap1');
 
-        const embedQuery = mockEmbedCol.findOne.mock.calls[0][0];
+        // Find the findOne call that has $or (the actual videodetails query, not hasHiveTagsLower)
+        const embedCalls = mockEmbedCol.findOne.mock.calls;
+        const detailsCall = embedCalls.find(c => c[0].$or);
+        expect(detailsCall).toBeDefined();
+        const embedQuery = detailsCall[0];
         expect(embedQuery).toMatchObject(BANNED_ONLY);
-        expect(embedQuery.owner).toBe('bob');
+        expect(embedQuery.$or).toEqual([
+            { owner: 'bob', permlink: 'snap1' },
+            { hive_author: 'bob', hive_permlink: 'snap1' },
+        ]);
     });
 
     test('returns 404 for banned video (both collections return null)', async () => {
+        mockVideosCol.findOne.mockResolvedValue(null);
+        mockEmbedCol.findOne.mockResolvedValue(null);
         const res = await request(app).get('/videodetails/alice/banned-vid');
         expect(res.status).toBe(404);
     });

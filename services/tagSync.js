@@ -44,9 +44,9 @@ function startTagSyncWatcher() {
                 if (!doc) return;
 
                 const hiveTags = doc.hive_tags;
-                if (!Array.isArray(hiveTags) || hiveTags.length === 0) return;
-
-                const lower = hiveTags.map(t => (typeof t === 'string' ? t.toLowerCase() : String(t)));
+                const lower = Array.isArray(hiveTags) && hiveTags.length > 0
+                    ? hiveTags.map(t => (typeof t === 'string' ? t.toLowerCase() : String(t)))
+                    : [];
 
                 // Skip if already in sync
                 const existing = doc.hive_tags_lower;
