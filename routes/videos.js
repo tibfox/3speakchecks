@@ -8,6 +8,21 @@ const { getCachedViews, setCachedViews } = require('../utils/cache');
 const { validateApiKey } = require('../utils/middleware');
 const { ENABLE_MONGO_WRITES } = require('../utils/config');
 
+// Cache whether hive_tags_lower has been backfilled (check once, then remember)
+let _hasHiveTagsLower = null;
+async function hasHiveTagsLower(embedCollection) {
+    if (_hasHiveTagsLower !== null) return _hasHiveTagsLower;
+    const doc = await embedCollection.findOne({ hive_tags_lower: { $exists: true } }, { projection: { _id: 1 } });
+    _hasHiveTagsLower = !!doc;
+    return _hasHiveTagsLower;
+}
+
+function buildEmbedTagMatch(tagLower, useLowerField) {
+    return useLowerField
+        ? { hive_tags_lower: tagLower }
+        : { hive_tags: { $elemMatch: { $regex: new RegExp(`^${tagLower}$`, 'i') } } };
+}
+
 // Endpoint to get videos by tag
 router.get('/videos/tag/:tag', async (req, res) => {
     const db = getDb();
@@ -84,8 +99,10 @@ router.get('/videos/tag/:tag', async (req, res) => {
             const tagLower = tag.toLowerCase();
             const embedCollection = db.collection('embed-video');
 
-            // Build tag match for embed-video (hive_tags stores original case)
-            const embedTagMatch = { hive_tags: { $elemMatch: { $regex: new RegExp(`^${tagLower}$`, 'i') } } };
+            // Build tag match for embed-video — prefer pre-lowercased field, fall back to regex
+            // After running backfill-hive-tags-lower.js the fast path will be used
+            const useLower = await hasHiveTagsLower(embedCollection);
+            const embedTagMatch = buildEmbedTagMatch(tagLower, useLower);
 
             // "snaps" is a synonym for shorts — match all shorts regardless of tags
             const isSnapsTag = tagLower === 'snaps';
@@ -205,6 +222,65 @@ router.get('/videos/tag/:tag', async (req, res) => {
         res.status(500).json({
             error: 'Internal server error'
         });
+    }
+});
+
+// Lightweight endpoint: counts only (no document bodies)
+router.get('/videos/tag/:tag/counts', async (req, res) => {
+    const db = getDb();
+    try {
+        const { tag } = req.params;
+        if (!tag) return res.status(400).json({ error: 'Tag is required' });
+
+        const tagLower = tag.toLowerCase();
+        const sinceParam = parseInt(req.query.since) || 0;
+        const sinceDate = sinceParam ? new Date(sinceParam * 1000) : null;
+
+        const videosCollection = db.collection('videos');
+        const embedCollection = db.collection('embed-video');
+
+        if (tagLower === 'mantecurated') {
+            const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
+            const embedQuery = { mantecurated: true, status: 'published' };
+            if (sinceDate) {
+                legacyQuery.created = { $gte: sinceDate };
+                embedQuery.createdAt = { $gte: sinceDate };
+            }
+            const [legacyCount, embedCount] = await Promise.all([
+                videosCollection.countDocuments(legacyQuery),
+                embedCollection.countDocuments(embedQuery),
+            ]);
+            return res.json({ tag, videos: legacyCount, shorts: embedCount, total: legacyCount + embedCount });
+        }
+
+        const useLower = await hasHiveTagsLower(embedCollection);
+        const embedTagMatch = buildEmbedTagMatch(tagLower, useLower);
+        const isSnapsTag = tagLower === 'snaps';
+
+        const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
+        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+        const shortsQuery = { short: true, status: 'published', ...(isSnapsTag ? {} : embedTagMatch) };
+        if (sinceDate) {
+            legacyQuery.created = { $gte: sinceDate };
+            embedVideoQuery.createdAt = { $gte: sinceDate };
+            shortsQuery.createdAt = { $gte: sinceDate };
+        }
+
+        const [legacyCount, embedVideoCount, shortsCount] = await Promise.all([
+            videosCollection.countDocuments(legacyQuery),
+            embedCollection.countDocuments(embedVideoQuery),
+            embedCollection.countDocuments(shortsQuery),
+        ]);
+
+        res.json({
+            tag,
+            videos: legacyCount + embedVideoCount,
+            shorts: shortsCount,
+            total: legacyCount + embedVideoCount + shortsCount,
+        });
+    } catch (error) {
+        console.error('Error fetching tag counts:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 

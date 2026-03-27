@@ -94,6 +94,11 @@ async function createIndexes() {
             { short: 1, status: 1, processed: 1, owner: 1, createdAt: -1 },
             'short_status_processed_owner_createdAt_desc');
 
+        // For /videos/tag/:tag — fast tag lookup using pre-lowercased array
+        await createIndex(embedVideoCollection,
+            { hive_tags_lower: 1, short: 1, status: 1, createdAt: -1 },
+            'hive_tags_lower_short_status_createdAt_desc');
+
         console.log('\nAll indexes on embed-video collection:');
         const embedIndexes = await embedVideoCollection.indexes();
         embedIndexes.forEach(index => {
