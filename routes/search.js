@@ -24,7 +24,7 @@ router.get('/suggest', async (req, res) => {
         const prefixRegex = { $regex: `^${escapedQ}`, $options: 'i' };
         const containsRegex = { $regex: escapedQ, $options: 'i' };
 
-        const [titles, usernames, tags, communities] = await Promise.all([
+        const [titles, usernames, tags, communities, playlists] = await Promise.all([
             db.collection('videos').find(
                 { title: containsRegex, status: 'published', publishFailed: { $ne: true } },
                 { projection: { title: 1, author: 1, owner: 1, permlink: 1, _id: 0 } }
@@ -56,15 +56,20 @@ router.get('/suggest', async (req, res) => {
             }),
             db.collection('hivecommunities').find(
                 { $or: [{ name: prefixRegex }, { title: containsRegex }] },
-                { projection: { name: 1, title: 1, subscribers: 1, _id: 0 } }
-            ).sort({ subscribers: -1 }).limit(5).toArray()
+                { projection: { name: 1, title: 1, about: 1, subscribers: 1, num_authors: 1, _id: 0 } }
+            ).sort({ subscribers: -1 }).limit(5).toArray(),
+            db.collection('playlists').find(
+                { access: 'public', name: { $ne: 'Watch Later' }, $or: [{ name: containsRegex }, { tags: containsRegex }] },
+                { projection: { _id: 1, name: 1, owner: 1, items: 1 } }
+            ).limit(5).toArray()
         ]);
 
         const suggestions = [
             ...titles.map(d => ({ type: 'title', text: d.title, author: d.author || d.owner || '', permlink: d.permlink || '' })),
             ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
             ...tags.map(t => ({ type: 'tag', text: t })),
-            ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', subscribers: d.subscribers || 0 }))
+            ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', about: d.about || '', subscribers: d.subscribers || 0, num_authors: d.num_authors || 0 })),
+            ...playlists.map(d => ({ type: 'playlist', id: d._id, name: d.name || '', owner: d.owner || '', video_count: Array.isArray(d.items) ? d.items.length : 0 }))
         ];
 
         res.json({ success: true, query: q, suggestions });
@@ -297,6 +302,34 @@ router.get('/', async (req, res) => {
             );
         }
 
+        // Public playlists (excluding Watch Later)
+        if (wantType('playlist')) {
+            const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const playlistRegex = { $regex: escapedQ, $options: 'i' };
+            searches.push(
+                db.collection('playlists').find({
+                    access: 'public',
+                    name: { $ne: 'Watch Later' },
+                    $or: [
+                        { name: playlistRegex },
+                        { tags: playlistRegex },
+                    ],
+                }, { projection: { _id: 1, name: 1, owner: 1, thumbnail: 1, tags: 1, items: 1, created_at: 1 } })
+                .sort({ created_at: -1 }).limit(maxPerCollection).toArray()
+                .then(docs => docs.map(d => ({
+                    type: 'playlist',
+                    id: d._id,
+                    name: d.name || '',
+                    owner: d.owner || '',
+                    thumbnail: d.thumbnail || '',
+                    tags: d.tags || [],
+                    video_count: Array.isArray(d.items) ? d.items.length : 0,
+                    created_at: d.created_at,
+                    score: 1
+                })))
+            );
+        }
+
         // Subtitle-tags join: find videos matching by AI-generated tags
         if (wantType('video') || wantType('short')) {
             const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -411,6 +444,7 @@ router.get('/', async (req, res) => {
             let key;
             if (r.type === 'user') key = `user:${r.username}`;
             else if (r.type === 'community') key = `community:${r.name}`;
+            else if (r.type === 'playlist') key = `playlist:${r.id}`;
             else key = `${r.type}:${r.owner}:${r.permlink}`;
             if (!seen.has(key)) {
                 seen.add(key);
@@ -421,7 +455,8 @@ router.get('/', async (req, res) => {
         // Apply highlighting
         if (highlight && searchTerms.length > 0) {
             for (const r of deduped) {
-                r.title_highlighted = highlightMatches(r.title, searchTerms);
+                if (r.title !== undefined) r.title_highlighted = highlightMatches(r.title, searchTerms);
+                if (r.name !== undefined) r.name_highlighted = highlightMatches(r.name, searchTerms);
                 if (r.about !== undefined) r.about_highlighted = highlightMatches(r.about, searchTerms);
                 if (r.display_name !== undefined) r.display_name_highlighted = highlightMatches(r.display_name, searchTerms);
             }

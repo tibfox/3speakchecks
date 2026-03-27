@@ -8,6 +8,7 @@ const { calculateAndFlagTrendingVideos } = require('./services/trending');
 const { syncHiveCommunities } = require('./services/communitySync');
 const { syncHiveProfiles } = require('./services/profileSync');
 const { denormalizeCommunityTitles } = require('./services/communityDenorm');
+const { startTagSyncWatcher } = require('./services/tagSync');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -45,6 +46,9 @@ let syncRunning = false;
 // Start server
 async function startServer() {
     await connectToMongo();
+
+    // Start change stream watcher to keep hive_tags_lower in sync
+    startTagSyncWatcher();
 
     // Initialize trending videos on startup
     console.log('Initializing trending videos...');

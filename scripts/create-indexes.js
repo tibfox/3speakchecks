@@ -94,6 +94,11 @@ async function createIndexes() {
             { short: 1, status: 1, processed: 1, owner: 1, createdAt: -1 },
             'short_status_processed_owner_createdAt_desc');
 
+        // For /videos/tag/:tag — fast tag lookup using pre-lowercased array
+        await createIndex(embedVideoCollection,
+            { hive_tags_lower: 1, short: 1, status: 1, createdAt: -1 },
+            'hive_tags_lower_short_status_createdAt_desc');
+
         console.log('\nAll indexes on embed-video collection:');
         const embedIndexes = await embedVideoCollection.indexes();
         embedIndexes.forEach(index => {
@@ -159,6 +164,11 @@ async function createIndexes() {
         await createIndex(playlistsCollection,
             { access: 1, 'items.author': 1, 'items.permlink': 1 },
             'access_items_author_permlink');
+
+        // For search — filter public playlists by name or tags
+        await createIndex(playlistsCollection,
+            { access: 1, name: 1, tags: 1 },
+            'access_name_tags');
 
         console.log('\nAll indexes on playlists collection:');
         const playlistIndexes = await playlistsCollection.indexes();

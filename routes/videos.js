@@ -1,11 +1,34 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../utils/db');
-const { nsfwFilter, nsfwFilterTags, BANNED_FILTER } = require('../utils/filters');
+const { nsfwFilter, nsfwFilterTags, nsfwFilterHiveTags, BANNED_FILTER } = require('../utils/filters');
+const { HIDDEN_AUTHORS } = require('../utils/config');
 const { getFollowingList } = require('../utils/hive');
 const { getCachedViews, setCachedViews } = require('../utils/cache');
 const { validateApiKey } = require('../utils/middleware');
 const { ENABLE_MONGO_WRITES } = require('../utils/config');
+
+// Cache whether hive_tags_lower has been backfilled
+// Once true it stays true. If false, re-check periodically so a backfill
+// or the change-stream watcher can flip it without requiring a restart.
+let _hasHiveTagsLower = false;
+let _lastCheckedAt = 0;
+const RECHECK_INTERVAL_MS = 60_000;
+async function hasHiveTagsLower(embedCollection) {
+    if (_hasHiveTagsLower) return true;
+    const now = Date.now();
+    if (now - _lastCheckedAt < RECHECK_INTERVAL_MS) return false;
+    _lastCheckedAt = now;
+    const doc = await embedCollection.findOne({ hive_tags_lower: { $exists: true } }, { projection: { _id: 1 } });
+    _hasHiveTagsLower = !!doc;
+    return _hasHiveTagsLower;
+}
+
+function buildEmbedTagMatch(tagLower, useLowerField) {
+    return useLowerField
+        ? { hive_tags_lower: tagLower }
+        : { hive_tags: { $elemMatch: { $regex: new RegExp(`^${tagLower}$`, 'i') } } };
+}
 
 // Endpoint to get videos by tag
 router.get('/videos/tag/:tag', async (req, res) => {
@@ -24,27 +47,159 @@ router.get('/videos/tag/:tag', async (req, res) => {
         const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
         const skip = (page - 1) * limit;
 
+        // Type filter: 'videos', 'shorts', or undefined (all)
+        const type = req.query.type;
+
+        // Since filter: unix timestamp (seconds) — only return content created after this
+        const sinceParam = parseInt(req.query.since) || 0;
+        const sinceDate = sinceParam ? new Date(sinceParam * 1000) : null;
+
         // Query the videos collection
         const videosCollection = db.collection('videos');
 
-        // Build query to find published videos with the tag in tags_v2 array
-        const query = {
-            tags_v2: tag.toLowerCase(),
-            status: 'published',
-            ...nsfwFilter(req)
-        };
+        // Build query — special case for "mantecurated" tag
+        let videos, total;
+        if (tag.toLowerCase() === 'mantecurated') {
+            const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
+            const embedQuery = { mantecurated: true, status: 'published' };
+            if (sinceDate) {
+                legacyQuery.created = { $gte: sinceDate };
+                embedQuery.createdAt = { $gte: sinceDate };
+            }
 
-        // Get total count for pagination
-        const total = await videosCollection.countDocuments(query);
+            const fetchLegacy = type !== 'shorts'
+                ? videosCollection.find(legacyQuery).sort({ created: -1 }).toArray()
+                : Promise.resolve([]);
+            const fetchEmbed = type !== 'videos'
+                ? db.collection('embed-video').find(embedQuery).sort({ createdAt: -1 }).toArray()
+                : Promise.resolve([]);
+
+            const [legacyVideos, embedVideosRaw] = await Promise.all([fetchLegacy, fetchEmbed]);
+            const normalized = embedVideosRaw.map(ev => ({
+                owner: ev.owner,
+                author: ev.hive_author || ev.owner,
+                permlink: ev.hive_permlink || ev.permlink,
+                title: ev.hive_title || ev.embed_title || ev.originalFilename || '',
+                body: ev.hive_body || '',
+                status: 'published',
+                created: ev.createdAt,
+                created_at: ev.createdAt,
+                duration: ev.duration || 0,
+                tags: ev.hive_tags || [],
+                tags_v2: (ev.hive_tags || []).map(t => t.toLowerCase()),
+                images: {
+                    thumbnail: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/thumbnail.png`,
+                    poster: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/poster.jpg`
+                },
+                spkvideo: {
+                    duration: ev.duration || 0,
+                    video_v2: ev.permlink,
+                    play_url: ev.manifest_cid ? `https://ipfs.3speak.tv/ipfs/${ev.manifest_cid}` : null
+                },
+                short: !!ev.short,
+                _source: 'embed',
+            }));
+            const merged = [...legacyVideos, ...normalized].sort((a, b) => new Date(b.created) - new Date(a.created));
+            total = merged.length;
+            videos = merged.slice(skip, skip + limit);
+        } else {
+            const tagLower = tag.toLowerCase();
+            const embedCollection = db.collection('embed-video');
+
+            // Build tag match for embed-video — prefer pre-lowercased field, fall back to regex
+            // After running backfill-hive-tags-lower.js the fast path will be used
+            const useLower = await hasHiveTagsLower(embedCollection);
+            const embedTagMatch = buildEmbedTagMatch(tagLower, useLower);
+
+            // "snaps" is a synonym for shorts — match all shorts regardless of tags
+            const isSnapsTag = tagLower === 'snaps';
+            const shortsTagMatch = isSnapsTag ? {} : embedTagMatch;
+
+            // Normalize embed-video docs to match legacy format
+            const normalizeEmbed = (ev) => ({
+                owner: ev.owner,
+                author: ev.hive_author || ev.owner,
+                permlink: ev.hive_permlink || ev.permlink,
+                title: ev.hive_title || ev.embed_title || ev.originalFilename || '',
+                body: ev.hive_body || '',
+                status: 'published',
+                created: ev.createdAt,
+                created_at: ev.createdAt,
+                duration: ev.duration || 0,
+                tags: ev.hive_tags || [],
+                tags_v2: (ev.hive_tags || []).map(t => t.toLowerCase()),
+                images: {
+                    thumbnail: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/thumbnail.png`,
+                    poster: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/poster.jpg`
+                },
+                spkvideo: {
+                    duration: ev.duration || 0,
+                    video_v2: ev.permlink,
+                    play_url: ev.manifest_cid ? `https://ipfs.3speak.tv/ipfs/${ev.manifest_cid}` : null
+                },
+                short: !!ev.short,
+                _source: 'embed',
+            });
+
+            if (type === 'videos') {
+                // Videos only: use DB-level pagination on legacy, small embed set
+                const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+                if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
+
+                const [legacyCount, embedDocs] = await Promise.all([
+                    videosCollection.countDocuments(legacyQuery),
+                    embedCollection.find(embedQuery).sort({ createdAt: -1 }).limit(skip + limit).toArray(),
+                ]);
+
+                const normalizedEmbed = embedDocs.map(normalizeEmbed);
+                // If page falls within legacy range, use DB skip/limit
+                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).skip(skip).limit(limit).toArray();
+                const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
+
+                // Deduplicate
+                const legacyKeys = new Set(legacyMapped.map(v => `${v.author || v.owner}/${v.permlink}`));
+                const uniqueEmbed = normalizedEmbed.filter(v => !legacyKeys.has(`${v.author}/${v.permlink}`));
+
+                // Merge, sort, paginate
+                const merged = [...legacyMapped, ...uniqueEmbed].sort((a, b) => new Date(b.created) - new Date(a.created));
+                total = legacyCount + normalizedEmbed.length;
+                videos = merged.slice(0, limit);
+
+            } else if (type === 'shorts') {
+                // Shorts only: DB-level pagination on embed-video
+                const query = { short: true, status: 'published', ...shortsTagMatch };
+                if (sinceDate) query.createdAt = { $gte: sinceDate };
+
+                total = await embedCollection.countDocuments(query);
+                const docs = await embedCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray();
+                videos = docs.map(normalizeEmbed);
+
+            } else {
+                // No type specified — default to videos behaviour
+                const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+                if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
+
+                const [legacyCount, embedDocs] = await Promise.all([
+                    videosCollection.countDocuments(legacyQuery),
+                    embedCollection.find(embedQuery).sort({ createdAt: -1 }).limit(skip + limit).toArray(),
+                ]);
+
+                const normalizedEmbed = embedDocs.map(normalizeEmbed);
+                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).skip(skip).limit(limit).toArray();
+                const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
+
+                const legacyKeys = new Set(legacyMapped.map(v => `${v.author || v.owner}/${v.permlink}`));
+                const uniqueEmbed = normalizedEmbed.filter(v => !legacyKeys.has(`${v.author}/${v.permlink}`));
+
+                const merged = [...legacyMapped, ...uniqueEmbed].sort((a, b) => new Date(b.created) - new Date(a.created));
+                total = legacyCount + normalizedEmbed.length;
+                videos = merged.slice(0, limit);
+            }
+        }
+
         const totalPages = Math.ceil(total / limit);
-
-        // Fetch videos with pagination, sorted by created descending (newest first)
-        const videos = await videosCollection
-            .find(query)
-            .sort({ created: -1 })
-            .skip(skip)
-            .limit(limit)
-            .toArray();
 
         // Return response
         res.json({
@@ -61,6 +216,65 @@ router.get('/videos/tag/:tag', async (req, res) => {
         res.status(500).json({
             error: 'Internal server error'
         });
+    }
+});
+
+// Lightweight endpoint: counts only (no document bodies)
+router.get('/videos/tag/:tag/counts', async (req, res) => {
+    const db = getDb();
+    try {
+        const { tag } = req.params;
+        if (!tag) return res.status(400).json({ error: 'Tag is required' });
+
+        const tagLower = tag.toLowerCase();
+        const sinceParam = parseInt(req.query.since) || 0;
+        const sinceDate = sinceParam ? new Date(sinceParam * 1000) : null;
+
+        const videosCollection = db.collection('videos');
+        const embedCollection = db.collection('embed-video');
+
+        if (tagLower === 'mantecurated') {
+            const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
+            const embedQuery = { mantecurated: true, status: 'published' };
+            if (sinceDate) {
+                legacyQuery.created = { $gte: sinceDate };
+                embedQuery.createdAt = { $gte: sinceDate };
+            }
+            const [legacyCount, embedCount] = await Promise.all([
+                videosCollection.countDocuments(legacyQuery),
+                embedCollection.countDocuments(embedQuery),
+            ]);
+            return res.json({ tag, videos: legacyCount, shorts: embedCount, total: legacyCount + embedCount });
+        }
+
+        const useLower = await hasHiveTagsLower(embedCollection);
+        const embedTagMatch = buildEmbedTagMatch(tagLower, useLower);
+        const isSnapsTag = tagLower === 'snaps';
+
+        const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
+        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+        const shortsQuery = { short: true, status: 'published', ...(isSnapsTag ? {} : embedTagMatch) };
+        if (sinceDate) {
+            legacyQuery.created = { $gte: sinceDate };
+            embedVideoQuery.createdAt = { $gte: sinceDate };
+            shortsQuery.createdAt = { $gte: sinceDate };
+        }
+
+        const [legacyCount, embedVideoCount, shortsCount] = await Promise.all([
+            videosCollection.countDocuments(legacyQuery),
+            embedCollection.countDocuments(embedVideoQuery),
+            embedCollection.countDocuments(shortsQuery),
+        ]);
+
+        res.json({
+            tag,
+            videos: legacyCount + embedVideoCount,
+            shorts: shortsCount,
+            total: legacyCount + embedVideoCount + shortsCount,
+        });
+    } catch (error) {
+        console.error('Error fetching tag counts:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -378,6 +592,39 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
             error: 'Internal server error',
             message: 'Failed to update thumbnail'
         });
+    }
+});
+
+// Endpoint to get extended video details by author/permlink
+router.get('/videodetails/:author/:permlink', async (req, res) => {
+    const db = getDb();
+    try {
+        const { author, permlink } = req.params;
+
+        if (!author || !permlink) {
+            return res.status(400).json({ error: 'Author and permlink are required' });
+        }
+
+        const video = await db.collection('videos').findOne(
+            { owner: author, permlink }
+        ) || await db.collection('embed-video').findOne(
+            { owner: author, permlink }
+        );
+
+        if (!video) {
+            return res.status(404).json({ error: 'Video not found' });
+        }
+
+        // Default mantecurated to false if not set
+        if (video.mantecurated === undefined) {
+            video.mantecurated = false;
+        }
+
+        res.json(video);
+
+    } catch (error) {
+        console.error('Error fetching video details:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
