@@ -29,6 +29,20 @@ function buildEmbedTagMatch(tagLower, useLowerField) {
         : { hive_tags: { $elemMatch: { $regex: new RegExp(`^${tagLower}$`, 'i') } } };
 }
 
+// Combines nsfwFilterHiveTags + tag match into a single filter.
+// When both use the hive_tags key (regex fallback path), merges via $and
+// to avoid the tag match overwriting the NSFW exclusion.
+function buildEmbedFilter(req, tagLower, useLowerField) {
+    const nsfw = nsfwFilterHiveTags(req);
+    const tagMatch = buildEmbedTagMatch(tagLower, useLowerField);
+
+    if (!useLowerField && nsfw.hive_tags) {
+        const { hive_tags: nsfwHiveTags, ...rest } = nsfw;
+        return { ...rest, $and: [{ hive_tags: nsfwHiveTags }, tagMatch] };
+    }
+    return { ...nsfw, ...tagMatch };
+}
+
 // Endpoint to get videos by tag
 router.get('/videos/tag/:tag', async (req, res) => {
     const db = getDb();
@@ -60,11 +74,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
         let videos, total;
         if (tag.toLowerCase() === 'mantecurated') {
             const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
-<<<<<<< HEAD
-            const embedQuery = { mantecurated: true, status: 'published' };
-=======
             const embedQuery = { mantecurated: true, status: 'published', ...nsfwFilterHiveTags(req) };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
             if (sinceDate) {
                 legacyQuery.created = { $gte: sinceDate };
                 embedQuery.createdAt = { $gte: sinceDate };
@@ -147,11 +157,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
             if (type === 'videos') {
                 // Videos only: use DB-level pagination on legacy, small embed set
                 const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-<<<<<<< HEAD
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
-=======
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...nsfwFilterHiveTags(req), ...embedTagMatch };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
 
                 const [legacyCount, embedDocs] = await Promise.all([
@@ -175,11 +181,10 @@ router.get('/videos/tag/:tag', async (req, res) => {
 
             } else if (type === 'shorts') {
                 // Shorts only: DB-level pagination on embed-video
-<<<<<<< HEAD
-                const query = { short: true, status: 'published', ...shortsTagMatch };
-=======
-                const query = { short: true, status: 'published', ...nsfwFilterHiveTags(req), ...shortsTagMatch };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
+                const shortsNsfw = nsfwFilterHiveTags(req);
+                const query = isSnapsTag
+                    ? { short: true, status: 'published', ...shortsNsfw }
+                    : { short: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) query.createdAt = { $gte: sinceDate };
 
                 total = await embedCollection.countDocuments(query);
@@ -189,11 +194,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
             } else {
                 // No type specified — default to videos behaviour
                 const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-<<<<<<< HEAD
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
-=======
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...nsfwFilterHiveTags(req), ...embedTagMatch };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
 
                 const [legacyCount, embedDocs] = await Promise.all([
@@ -250,11 +251,7 @@ router.get('/videos/tag/:tag/counts', async (req, res) => {
 
         if (tagLower === 'mantecurated') {
             const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
-<<<<<<< HEAD
-            const embedQuery = { mantecurated: true, status: 'published' };
-=======
             const embedQuery = { mantecurated: true, status: 'published', ...nsfwFilterHiveTags(req) };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
             if (sinceDate) {
                 legacyQuery.created = { $gte: sinceDate };
                 embedQuery.createdAt = { $gte: sinceDate };
@@ -271,13 +268,10 @@ router.get('/videos/tag/:tag/counts', async (req, res) => {
         const isSnapsTag = tagLower === 'snaps';
 
         const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-<<<<<<< HEAD
-        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
-        const shortsQuery = { short: true, status: 'published', ...(isSnapsTag ? {} : embedTagMatch) };
-=======
-        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...nsfwFilterHiveTags(req), ...embedTagMatch };
-        const shortsQuery = { short: true, status: 'published', ...nsfwFilterHiveTags(req), ...(isSnapsTag ? {} : embedTagMatch) };
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
+        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
+        const shortsQuery = isSnapsTag
+            ? { short: true, status: 'published', ...nsfwFilterHiveTags(req) }
+            : { short: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
         if (sinceDate) {
             legacyQuery.created = { $gte: sinceDate };
             embedVideoQuery.createdAt = { $gte: sinceDate };
@@ -630,15 +624,9 @@ router.get('/videodetails/:author/:permlink', async (req, res) => {
         }
 
         const video = await db.collection('videos').findOne(
-<<<<<<< HEAD
-            { owner: author, permlink }
-        ) || await db.collection('embed-video').findOne(
-            { owner: author, permlink }
-=======
             { owner: author, permlink, ...BANNED_FILTER }
         ) || await db.collection('embed-video').findOne(
             { owner: author, permlink, ...BANNED_FILTER }
->>>>>>> 91e54a0 (Apply PR #20 with NSFW/banned filter fix on embed-video queries)
         );
 
         if (!video) {
