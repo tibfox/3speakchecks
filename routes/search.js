@@ -56,7 +56,7 @@ router.get('/suggest', async (req, res) => {
             }),
             db.collection('hivecommunities').find(
                 { $or: [{ name: prefixRegex }, { title: containsRegex }] },
-                { projection: { name: 1, title: 1, subscribers: 1, _id: 0 } }
+                { projection: { name: 1, title: 1, about: 1, subscribers: 1, num_authors: 1, _id: 0 } }
             ).sort({ subscribers: -1 }).limit(5).toArray()
         ]);
 
@@ -64,7 +64,7 @@ router.get('/suggest', async (req, res) => {
             ...titles.map(d => ({ type: 'title', text: d.title, author: d.author || d.owner || '', permlink: d.permlink || '' })),
             ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
             ...tags.map(t => ({ type: 'tag', text: t })),
-            ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', subscribers: d.subscribers || 0 }))
+            ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', about: d.about || '', subscribers: d.subscribers || 0, num_authors: d.num_authors || 0 }))
         ];
 
         res.json({ success: true, query: q, suggestions });
