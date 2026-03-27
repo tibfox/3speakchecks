@@ -8,10 +8,17 @@ const { getCachedViews, setCachedViews } = require('../utils/cache');
 const { validateApiKey } = require('../utils/middleware');
 const { ENABLE_MONGO_WRITES } = require('../utils/config');
 
-// Cache whether hive_tags_lower has been backfilled (check once, then remember)
-let _hasHiveTagsLower = null;
+// Cache whether hive_tags_lower has been backfilled
+// Once true it stays true. If false, re-check periodically so a backfill
+// or the change-stream watcher can flip it without requiring a restart.
+let _hasHiveTagsLower = false;
+let _lastCheckedAt = 0;
+const RECHECK_INTERVAL_MS = 60_000;
 async function hasHiveTagsLower(embedCollection) {
-    if (_hasHiveTagsLower !== null) return _hasHiveTagsLower;
+    if (_hasHiveTagsLower) return true;
+    const now = Date.now();
+    if (now - _lastCheckedAt < RECHECK_INTERVAL_MS) return false;
+    _lastCheckedAt = now;
     const doc = await embedCollection.findOne({ hive_tags_lower: { $exists: true } }, { projection: { _id: 1 } });
     _hasHiveTagsLower = !!doc;
     return _hasHiveTagsLower;
