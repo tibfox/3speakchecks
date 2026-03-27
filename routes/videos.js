@@ -176,39 +176,26 @@ router.get('/videos/tag/:tag', async (req, res) => {
                 videos = docs.map(normalizeEmbed);
 
             } else {
-                // All: merge legacy + embed long-form + shorts, paginate in memory
-                // Limit fetch to skip + limit per source to avoid loading everything
-                const fetchCap = skip + limit;
+                // No type specified — default to videos behaviour
                 const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-                const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
-                const shortsQuery = { short: true, status: 'published', ...shortsTagMatch };
-                if (sinceDate) {
-                    legacyQuery.created = { $gte: sinceDate };
-                    embedVideoQuery.createdAt = { $gte: sinceDate };
-                    shortsQuery.createdAt = { $gte: sinceDate };
-                }
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+                if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
 
-                const [legacyDocs, embedDocs, shortDocs, legacyCount, embedCount, shortsCount] = await Promise.all([
-                    videosCollection.find(legacyQuery).sort({ created: -1 }).limit(fetchCap).toArray(),
-                    embedCollection.find(embedVideoQuery).sort({ createdAt: -1 }).limit(fetchCap).toArray(),
-                    embedCollection.find(shortsQuery).sort({ createdAt: -1 }).limit(fetchCap).toArray(),
+                const [legacyCount, embedDocs] = await Promise.all([
                     videosCollection.countDocuments(legacyQuery),
-                    embedCollection.countDocuments(embedVideoQuery),
-                    embedCollection.countDocuments(shortsQuery),
+                    embedCollection.find(embedQuery).sort({ createdAt: -1 }).limit(skip + limit).toArray(),
                 ]);
 
-                const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
                 const normalizedEmbed = embedDocs.map(normalizeEmbed);
-                const normalizedShorts = shortDocs.map(normalizeEmbed);
+                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).skip(skip).limit(limit).toArray();
+                const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
 
-                // Deduplicate embed long-form against legacy
                 const legacyKeys = new Set(legacyMapped.map(v => `${v.author || v.owner}/${v.permlink}`));
                 const uniqueEmbed = normalizedEmbed.filter(v => !legacyKeys.has(`${v.author}/${v.permlink}`));
 
-                const merged = [...legacyMapped, ...uniqueEmbed, ...normalizedShorts]
-                    .sort((a, b) => new Date(b.created) - new Date(a.created));
-                total = legacyCount + embedCount + shortsCount;
-                videos = merged.slice(skip, skip + limit);
+                const merged = [...legacyMapped, ...uniqueEmbed].sort((a, b) => new Date(b.created) - new Date(a.created));
+                total = legacyCount + normalizedEmbed.length;
+                videos = merged.slice(0, limit);
             }
         }
 
