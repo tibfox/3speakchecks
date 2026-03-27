@@ -165,6 +165,11 @@ async function createIndexes() {
             { access: 1, 'items.author': 1, 'items.permlink': 1 },
             'access_items_author_permlink');
 
+        // For search — filter public playlists by name or tags
+        await createIndex(playlistsCollection,
+            { access: 1, name: 1, tags: 1 },
+            'access_name_tags');
+
         console.log('\nAll indexes on playlists collection:');
         const playlistIndexes = await playlistsCollection.indexes();
         playlistIndexes.forEach(index => {
