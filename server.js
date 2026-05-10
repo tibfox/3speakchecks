@@ -9,6 +9,7 @@ const { syncHiveCommunities } = require('./services/communitySync');
 const { syncHiveProfiles } = require('./services/profileSync');
 const { denormalizeCommunityTitles } = require('./services/communityDenorm');
 const { startTagSyncWatcher } = require('./services/tagSync');
+const { syncAudioHiveLinks } = require('./services/audioHiveSync');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -105,6 +106,16 @@ async function startServer() {
         setInterval(runProfileSync, profIntervalMs);
     }, profDelayMs);
     console.log(`Profile sync scheduled every ${PROFILE_SYNC_INTERVAL_H}h (first run in ${PROFILE_SYNC_DELAY_H}h)`);
+
+    // Sync audio → Hive post links (delayed 2min, then every 30min)
+    setTimeout(() => {
+        syncAudioHiveLinks().catch(err => console.error('Audio Hive sync error:', err));
+        setInterval(() => {
+            if (syncRunning) return;
+            syncAudioHiveLinks().catch(err => console.error('Audio Hive sync error:', err));
+        }, 30 * 60 * 1000);
+    }, 2 * 60 * 1000);
+    console.log('Audio-Hive link sync scheduled every 30min (first run in 2min)');
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
