@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../utils/db');
 const { nsfwFilter, nsfwFilterTags, nsfwFilterHiveTags, BANNED_FILTER } = require('../utils/filters');
-const { HIDDEN_AUTHORS } = require('../utils/config');
 const { getFollowingList } = require('../utils/hive');
 const { getCachedViews, setCachedViews } = require('../utils/cache');
 const { validateApiKey } = require('../utils/middleware');
@@ -19,15 +18,36 @@ async function hasHiveTagsLower(embedCollection) {
     const now = Date.now();
     if (now - _lastCheckedAt < RECHECK_INTERVAL_MS) return false;
     _lastCheckedAt = now;
-    const doc = await embedCollection.findOne({ hive_tags_lower: { $exists: true } }, { projection: { _id: 1 } });
-    _hasHiveTagsLower = !!doc;
+    const missing = await embedCollection.findOne(
+        { hive_tags: { $exists: true }, hive_tags_lower: { $exists: false } },
+        { projection: { _id: 1 } }
+    );
+    _hasHiveTagsLower = !missing;
     return _hasHiveTagsLower;
+}
+
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildEmbedTagMatch(tagLower, useLowerField) {
     return useLowerField
         ? { hive_tags_lower: tagLower }
-        : { hive_tags: { $elemMatch: { $regex: new RegExp(`^${tagLower}$`, 'i') } } };
+        : { hive_tags: { $elemMatch: { $regex: new RegExp(`^${escapeRegex(tagLower)}$`, 'i') } } };
+}
+
+// Combines nsfwFilterHiveTags + tag match into a single filter.
+// When both use the hive_tags key (regex fallback path), merges via $and
+// to avoid the tag match overwriting the NSFW exclusion.
+function buildEmbedFilter(req, tagLower, useLowerField) {
+    const nsfw = nsfwFilterHiveTags(req);
+    const tagMatch = buildEmbedTagMatch(tagLower, useLowerField);
+
+    if (!useLowerField && nsfw.hive_tags) {
+        const { hive_tags: nsfwHiveTags, ...rest } = nsfw;
+        return { ...rest, $and: [{ hive_tags: nsfwHiveTags }, tagMatch] };
+    }
+    return { ...nsfw, ...tagMatch };
 }
 
 // Endpoint to get videos by tag
@@ -61,11 +81,14 @@ router.get('/videos/tag/:tag', async (req, res) => {
         let videos, total;
         if (tag.toLowerCase() === 'mantecurated') {
             const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
-            const embedQuery = { mantecurated: true, status: 'published' };
+            const embedQuery = { mantecurated: true, status: 'published', ...nsfwFilterHiveTags(req) };
             if (sinceDate) {
                 legacyQuery.created = { $gte: sinceDate };
                 embedQuery.createdAt = { $gte: sinceDate };
             }
+
+            if (type === 'videos') embedQuery.short = false;
+            else if (type === 'shorts') embedQuery.short = true;
 
             const fetchLegacy = type !== 'shorts'
                 ? videosCollection.find(legacyQuery).sort({ created: -1 }).toArray()
@@ -144,7 +167,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
             if (type === 'videos') {
                 // Videos only: use DB-level pagination on legacy, small embed set
                 const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
 
                 const [legacyCount, embedDocs] = await Promise.all([
@@ -153,8 +176,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
                 ]);
 
                 const normalizedEmbed = embedDocs.map(normalizeEmbed);
-                // If page falls within legacy range, use DB skip/limit
-                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).skip(skip).limit(limit).toArray();
+                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).limit(skip + limit).toArray();
                 const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
 
                 // Deduplicate
@@ -163,12 +185,15 @@ router.get('/videos/tag/:tag', async (req, res) => {
 
                 // Merge, sort, paginate
                 const merged = [...legacyMapped, ...uniqueEmbed].sort((a, b) => new Date(b.created) - new Date(a.created));
-                total = legacyCount + normalizedEmbed.length;
-                videos = merged.slice(0, limit);
+                total = legacyCount + uniqueEmbed.length;
+                videos = merged.slice(skip, skip + limit);
 
             } else if (type === 'shorts') {
                 // Shorts only: DB-level pagination on embed-video
-                const query = { short: true, status: 'published', ...shortsTagMatch };
+                const shortsNsfw = nsfwFilterHiveTags(req);
+                const query = isSnapsTag
+                    ? { short: true, status: 'published', ...shortsNsfw }
+                    : { short: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) query.createdAt = { $gte: sinceDate };
 
                 total = await embedCollection.countDocuments(query);
@@ -178,7 +203,7 @@ router.get('/videos/tag/:tag', async (req, res) => {
             } else {
                 // No type specified — default to videos behaviour
                 const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
+                const embedQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
                 if (sinceDate) { legacyQuery.created = { $gte: sinceDate }; embedQuery.createdAt = { $gte: sinceDate }; }
 
                 const [legacyCount, embedDocs] = await Promise.all([
@@ -187,15 +212,15 @@ router.get('/videos/tag/:tag', async (req, res) => {
                 ]);
 
                 const normalizedEmbed = embedDocs.map(normalizeEmbed);
-                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).skip(skip).limit(limit).toArray();
+                const legacyDocs = await videosCollection.find(legacyQuery).sort({ created: -1 }).limit(skip + limit).toArray();
                 const legacyMapped = legacyDocs.map(v => ({ ...v, short: false }));
 
                 const legacyKeys = new Set(legacyMapped.map(v => `${v.author || v.owner}/${v.permlink}`));
                 const uniqueEmbed = normalizedEmbed.filter(v => !legacyKeys.has(`${v.author}/${v.permlink}`));
 
                 const merged = [...legacyMapped, ...uniqueEmbed].sort((a, b) => new Date(b.created) - new Date(a.created));
-                total = legacyCount + normalizedEmbed.length;
-                videos = merged.slice(0, limit);
+                total = legacyCount + uniqueEmbed.length;
+                videos = merged.slice(skip, skip + limit);
             }
         }
 
@@ -235,16 +260,22 @@ router.get('/videos/tag/:tag/counts', async (req, res) => {
 
         if (tagLower === 'mantecurated') {
             const legacyQuery = { mantecurated: true, status: 'published', ...nsfwFilter(req) };
-            const embedQuery = { mantecurated: true, status: 'published' };
+            const embedBaseQuery = { mantecurated: true, status: 'published', ...nsfwFilterHiveTags(req) };
             if (sinceDate) {
                 legacyQuery.created = { $gte: sinceDate };
-                embedQuery.createdAt = { $gte: sinceDate };
+                embedBaseQuery.createdAt = { $gte: sinceDate };
             }
-            const [legacyCount, embedCount] = await Promise.all([
+            const [legacyCount, embedVideoCount, embedShortCount] = await Promise.all([
                 videosCollection.countDocuments(legacyQuery),
-                embedCollection.countDocuments(embedQuery),
+                embedCollection.countDocuments({ ...embedBaseQuery, short: false }),
+                embedCollection.countDocuments({ ...embedBaseQuery, short: true }),
             ]);
-            return res.json({ tag, videos: legacyCount, shorts: embedCount, total: legacyCount + embedCount });
+            return res.json({
+                tag,
+                videos: legacyCount + embedVideoCount,
+                shorts: embedShortCount,
+                total: legacyCount + embedVideoCount + embedShortCount,
+            });
         }
 
         const useLower = await hasHiveTagsLower(embedCollection);
@@ -252,8 +283,10 @@ router.get('/videos/tag/:tag/counts', async (req, res) => {
         const isSnapsTag = tagLower === 'snaps';
 
         const legacyQuery = { tags_v2: tagLower, status: 'published', ...nsfwFilter(req) };
-        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...embedTagMatch };
-        const shortsQuery = { short: true, status: 'published', ...(isSnapsTag ? {} : embedTagMatch) };
+        const embedVideoQuery = { short: false, listed_on_3speak: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
+        const shortsQuery = isSnapsTag
+            ? { short: true, status: 'published', ...nsfwFilterHiveTags(req) }
+            : { short: true, status: 'published', ...buildEmbedFilter(req, tagLower, useLower) };
         if (sinceDate) {
             legacyQuery.created = { $gte: sinceDate };
             embedVideoQuery.createdAt = { $gte: sinceDate };
@@ -606,9 +639,15 @@ router.get('/videodetails/:author/:permlink', async (req, res) => {
         }
 
         const video = await db.collection('videos').findOne(
-            { owner: author, permlink }
+            { owner: author, permlink, ...BANNED_FILTER }
         ) || await db.collection('embed-video').findOne(
-            { owner: author, permlink }
+            {
+                $or: [
+                    { owner: author, permlink },
+                    { hive_author: author, hive_permlink: permlink },
+                ],
+                ...BANNED_FILTER,
+            }
         );
 
         if (!video) {
