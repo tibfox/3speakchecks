@@ -11,6 +11,7 @@ const { denormalizeCommunityTitles } = require('./services/communityDenorm');
 const { startTagSyncWatcher } = require('./services/tagSync');
 const { syncAudioHiveLinks } = require('./services/audioHiveSync');
 const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
+const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -118,17 +119,23 @@ async function startServer() {
     }, 2 * 60 * 1000);
     console.log('Audio-Hive link sync scheduled every 30min (first run in 2min)');
 
-    // Sync VSC subscription status → embed-users.premium (delayed 1min,
-    // then every 5min). Source of truth is the Okinoko Hasura indexer;
-    // worker only touches rows tagged premium_source='subs' on demote so
+    // Sync VSC subscription status → embed-users.premium. Runs on a
+    // tight 60s cadence so the 1-day pass expires within ±1min of its
+    // 24h window. Source of truth is the Okinoko Hasura indexer; worker
+    // only touches rows tagged premium_source='subs' on demote so
     // manual upgrades stay sticky.
     setTimeout(() => {
         syncPremiumFromSubs().catch(err => console.error('Premium subs sync error:', err));
         setInterval(() => {
             syncPremiumFromSubs().catch(err => console.error('Premium subs sync error:', err));
-        }, 5 * 60 * 1000);
-    }, 60 * 1000);
-    console.log('Premium subs sync scheduled every 5min (first run in 1min)');
+        }, 60 * 1000);
+    }, 30 * 1000);
+    console.log('Premium subs sync scheduled every 60s (first run in 30s)');
+
+    // Periodic collect_subscriptions for the Pro contract. Self-gated on
+    // env (THREESPEAK_PRO_USERNAME + THREESPEAK_PRO_POSTING_KEY); no-op
+    // and logs "disabled" when credentials aren't configured.
+    scheduleCollectSubs();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
