@@ -5,6 +5,38 @@ const { ObjectId } = require('mongodb');
 const { COLLECTION_NAME } = require('../utils/config');
 const { BANNED_FILTER } = require('../utils/filters');
 
+// Read-only premium-status lookup against embed-users. Used by the
+// frontend to render a Pro badge next to the user's avatar (nav, bottom
+// bar, AuthorBadge under videos). Source of truth is the embed-users
+// collection that the premiumSubsSync worker keeps in sync with the
+// VSC subscriptions contract; manual upgrades are also honored.
+router.get('/premium/:username', async (req, res) => {
+    try {
+        const db = getDb();
+        const { username } = req.params;
+        if (!username) return res.status(400).json({ premium: false, error: 'username required' });
+
+        const user = await db
+            .collection('embed-users')
+            .findOne(
+                { username: username.toLowerCase() },
+                { projection: { username: 1, premium: 1, premium_expires_at: 1 } },
+            );
+
+        // Cache for 60s on intermediaries — premium status only changes on
+        // the next subs-sync tick anyway, so longer caches just spread load.
+        res.set('Cache-Control', 'public, max-age=60');
+        return res.json({
+            username,
+            premium: !!(user && user.premium === true),
+            premium_expires_at: user?.premium_expires_at ?? null,
+        });
+    } catch (err) {
+        console.error('GET /premium error:', err.message);
+        return res.status(500).json({ premium: false, error: 'internal' });
+    }
+});
+
 router.get('/check/:username', async (req, res) => {
     try {
         const db = getDb();
