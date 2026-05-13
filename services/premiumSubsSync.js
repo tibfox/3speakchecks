@@ -228,11 +228,37 @@ async function syncPremiumFromSubs() {
         }
     }
 
+    // Expire Pro trial users whose 24h window is up. These rows are
+    // tagged premium_source='testing' and were written by the hangouts-
+    // api `/premium/start-testing` endpoint. We flip premium back off
+    // and clear the source / expiry — but keep `testing_started` so the
+    // user can't claim a second trial.
+    let expiredTrials = 0;
+    try {
+        if (ENABLE_MONGO_WRITES) {
+            const r = await col.updateMany(
+                {
+                    premium: true,
+                    premium_source: 'testing',
+                    premium_expires_at: { $lte: now },
+                },
+                {
+                    $set: { premium: false, premium_synced_at: now },
+                    $unset: { premium_source: '', premium_expires_at: '' },
+                },
+            );
+            expiredTrials = r.modifiedCount || 0;
+        }
+    } catch (err) {
+        console.error('[premiumSubsSync] Trial expiry sweep failed:', err.message);
+        errors++;
+    }
+
     console.log(
-        `[premiumSubsSync] Done: ${active.size} active, ${promoted} promoted, ${demoted} demoted, ${errors} errors`,
+        `[premiumSubsSync] Done: ${active.size} active, ${promoted} promoted, ${demoted} demoted, ${expiredTrials} trial-expired, ${errors} errors`,
     );
 
-    return { active: active.size, promoted, demoted, errors };
+    return { active: active.size, promoted, demoted, expiredTrials, errors };
 }
 
 module.exports = { syncPremiumFromSubs };

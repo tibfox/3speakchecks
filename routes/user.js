@@ -20,7 +20,7 @@ router.get('/premium/:username', async (req, res) => {
             .collection('embed-users')
             .findOne(
                 { username: username.toLowerCase() },
-                { projection: { username: 1, premium: 1, premium_expires_at: 1 } },
+                { projection: { username: 1, premium: 1, premium_source: 1, premium_expires_at: 1, testing_started: 1 } },
             );
 
         // Cache for 60s on intermediaries — premium status only changes on
@@ -29,7 +29,11 @@ router.get('/premium/:username', async (req, res) => {
         return res.json({
             username,
             premium: !!(user && user.premium === true),
+            premium_source: user?.premium_source ?? null,
             premium_expires_at: user?.premium_expires_at ?? null,
+            // testing_started is sticky for life — the frontend uses it to
+            // hide the "Try Pro free" button after the user's first claim.
+            testing_started: user?.testing_started ?? null,
         });
     } catch (err) {
         console.error('GET /premium error:', err.message);
