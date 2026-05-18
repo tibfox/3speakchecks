@@ -41,6 +41,36 @@ router.get('/premium/:username', async (req, res) => {
     }
 });
 
+// List all currently-premium accounts (active 3Speak Pro subscribers +
+// manual/trial). Powers the Pro page's subscriber ticker + popup.
+router.get('/premium', async (req, res) => {
+    try {
+        const db = getDb();
+        const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 5000);
+        const docs = await db
+            .collection('embed-users')
+            .find(
+                { premium: true },
+                { projection: { _id: 0, username: 1, premium_source: 1, premium_expires_at: 1 } },
+            )
+            .sort({ username: 1 })
+            .limit(limit)
+            .toArray();
+        res.set('Cache-Control', 'public, max-age=60');
+        return res.json({
+            count: docs.length,
+            subscribers: docs.map((d) => ({
+                username: d.username,
+                source: d.premium_source ?? null,
+                expires_at: d.premium_expires_at ?? null,
+            })),
+        });
+    } catch (err) {
+        console.error('GET /premium (list) error:', err.message);
+        return res.status(500).json({ count: 0, subscribers: [], error: 'internal' });
+    }
+});
+
 router.get('/check/:username', async (req, res) => {
     try {
         const db = getDb();
