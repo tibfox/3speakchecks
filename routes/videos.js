@@ -569,14 +569,27 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
             });
         }
 
-        // Query the videos collection
+        // A video can live in `videos` (legacy uploads) and/or `embed-video`
+        // (embed-pipeline uploads). Read paths differ per collection:
+        //   videos:      reads `thumbnail` (some also `thumbnail_url`)
+        //   embed-video: reads `thumbnail_url`
+        // So update whichever exist, on the right field(s). Only 404 if the
+        // video is in neither.
+        const now = new Date();
         const videosCollection = db.collection('videos');
-        const video = await videosCollection.findOne({
-            owner: owner,
-            permlink: permlink
-        });
+        const embedVideoCollection = db.collection('embed-video');
 
-        if (!video) {
+        const [videoDoc, embedDoc] = await Promise.all([
+            videosCollection.findOne({ owner, permlink }),
+            embedVideoCollection.findOne({
+                $or: [
+                    { owner, permlink },
+                    { hive_author: owner, hive_permlink: permlink },
+                ],
+            }),
+        ]);
+
+        if (!videoDoc && !embedDoc) {
             return res.status(404).json({
                 success: false,
                 error: 'Video not found',
@@ -584,27 +597,25 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
             });
         }
 
-        // Update the thumbnail
-        const result = await videosCollection.updateOne(
-            { owner: owner, permlink: permlink },
-            {
-                $set: {
-                    thumbnail: thumbnail,
-                    thumbnail_updated_at: new Date()
-                }
-            }
-        );
-
-        if (result.modifiedCount === 0) {
-            return res.status(500).json({
-                success: false,
-                error: 'Update failed',
-                message: 'Video found but thumbnail was not updated'
-            });
+        const updated = [];
+        if (videoDoc) {
+            await videosCollection.updateOne(
+                { owner, permlink },
+                // set both fields so every read path reflects it
+                { $set: { thumbnail, thumbnail_url: thumbnail, thumbnail_updated_at: now } }
+            );
+            updated.push('videos');
+        }
+        if (embedDoc) {
+            await embedVideoCollection.updateOne(
+                { _id: embedDoc._id },
+                { $set: { thumbnail_url: thumbnail, thumbnail_updated_at: now } }
+            );
+            updated.push('embed-video');
         }
 
         // Log the update for audit purposes
-        console.log(`Thumbnail updated for ${owner}/${permlink} to: ${thumbnail}`);
+        console.log(`Thumbnail updated for ${owner}/${permlink} in [${updated.join(', ')}] to: ${thumbnail}`);
 
         // Return success response
         res.json({
@@ -614,7 +625,8 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
                 owner: owner,
                 permlink: permlink,
                 thumbnail: thumbnail,
-                updated_at: new Date().toISOString()
+                collections: updated,
+                updated_at: now.toISOString()
             }
         });
 
