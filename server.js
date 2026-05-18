@@ -23,6 +23,7 @@ const shortsRoutes = require('./routes/shorts');
 const audioRoutes = require('./routes/audio');
 const feedsRoutes = require('./routes/feeds');
 const rssRoutes = require('./routes/rss');
+const verifyRoutes = require('./routes/verify');
 
 const app = express();
 
@@ -43,6 +44,7 @@ app.use('/', shortsRoutes);
 app.use('/audio', audioRoutes);
 app.use('/feeds', feedsRoutes);
 app.use('/rss', rssRoutes);
+app.use('/verify', verifyRoutes);
 
 // Track whether heavy sync tasks are running
 let syncRunning = false;

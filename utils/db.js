@@ -1,6 +1,35 @@
 const { MongoClient } = require('mongodb');
-const { MONGODB_URI, DATABASE_NAME } = require('./config');
+const { MONGODB_URI, DATABASE_NAME, SOCIAL_LINKS_COLLECTION, UNVERIFIED_TTL_DAYS } = require('./config');
 const searchWeights = require('../config/search-weights.json');
+
+// Social-link verifier indexes (merged from mantequilla-social-verifier):
+// one row per (hive_username, platform, canonical platform_username), a
+// duplicate-claim lookup, and a config-driven TTL on unverified rows.
+async function ensureSocialLinkIndexes(database) {
+    const coll = database.collection(SOCIAL_LINKS_COLLECTION);
+    const expireAfterSeconds = UNVERIFIED_TTL_DAYS * 24 * 60 * 60;
+    try {
+        await coll.createIndex(
+            { hive_username: 1, platform: 1, platform_username: 1 },
+            { unique: true, name: 'social_link_unique' },
+        );
+        await coll.createIndex(
+            { platform: 1, platform_username: 1, verified: 1 },
+            { name: 'social_link_platform_verified' },
+        );
+        const idxs = await coll.indexes();
+        const ttl = idxs.find(i => i.name === 'social_link_unverified_ttl');
+        if (ttl && ttl.expireAfterSeconds !== expireAfterSeconds) {
+            await coll.dropIndex('social_link_unverified_ttl');
+        }
+        await coll.createIndex(
+            { first_seen: 1 },
+            { name: 'social_link_unverified_ttl', expireAfterSeconds, partialFilterExpression: { verified: false } },
+        );
+    } catch (err) {
+        console.error('Failed to ensure social-link indexes:', err.message);
+    }
+}
 
 let db;
 
@@ -49,6 +78,10 @@ async function connectToMongo() {
             )
         ).then(() => console.log('Text search indexes ensured'))
           .catch(err => console.error('Text index creation failed:', err.message));
+
+        ensureSocialLinkIndexes(db)
+            .then(() => console.log('Social-link indexes ensured'))
+            .catch(err => console.error('Social-link index creation failed:', err.message));
     } catch (error) {
         console.error('Failed to connect to MongoDB:', error);
         process.exit(1);
@@ -59,4 +92,8 @@ function getDb() {
     return db;
 }
 
-module.exports = { connectToMongo, getDb };
+function getLinksCollection() {
+    return getDb().collection(SOCIAL_LINKS_COLLECTION);
+}
+
+module.exports = { connectToMongo, getDb, getLinksCollection };
