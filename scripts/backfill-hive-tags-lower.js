@@ -8,8 +8,9 @@
  *
  * Usage:  node backfill-hive-tags-lower.js
  */
+const path = require('path');
 const { MongoClient } = require('mongodb');
-require('dotenv').config({ path: '../.env' });
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = process.env.DATABASE_NAME || 'threespeak';
@@ -31,7 +32,7 @@ async function backfill() {
 
     let bulk = [];
     for await (const doc of cursor) {
-        const lower = (doc.hive_tags || []).map(t => t.toLowerCase());
+        const lower = (doc.hive_tags || []).map(t => (typeof t === 'string' ? t.toLowerCase() : String(t)));
         bulk.push({
             updateOne: {
                 filter: { _id: doc._id },
