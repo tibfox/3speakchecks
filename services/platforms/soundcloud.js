@@ -1,10 +1,15 @@
 // SoundCloud's official API (api.soundcloud.com) now requires an approved app
-// (effectively gated behind a paid artist plan), so we don't use it. Instead we
-// fetch the public, server-rendered profile page and read the `__sc_hydration`
-// JSON blob the web app embeds — it carries the same user fields (permalink,
-// username, full_name, city, description/bio) with no credentials needed.
+// (effectively gated behind a paid artist plan). The server-rendered profile
+// page does NOT include the bio/display-name (those load client-side), so
+// scraping the page HTML can't see where users put a verification hash.
+//
+// Instead we use SoundCloud's public web API (api-v2.soundcloud.com) with a
+// `client_id` lifted from the site's own JS bundle (no credentials, same
+// thing the web app does). api-v2 returns the full user incl. `description`
+// (bio), `full_name`, `city`.
 
-const PROFILE_BASE = 'https://soundcloud.com';
+const SITE_BASE = 'https://soundcloud.com';
+const API_BASE = 'https://api-v2.soundcloud.com';
 const UA =
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
@@ -20,60 +25,59 @@ function extractPermalink(raw) {
     return s.split(/[/?#]/)[0].trim().toLowerCase();
 }
 
-// Pull the JSON array literal that follows `window.__sc_hydration =` out of the
-// page HTML by walking it with a bracket-depth counter that respects strings
-// and escapes (the blob is minified but can contain `]` inside strings).
-function extractHydration(html) {
-    const marker = '__sc_hydration';
-    const at = html.indexOf(marker);
-    if (at === -1) return null;
-    const start = html.indexOf('[', at);
-    if (start === -1) return null;
+// Cached client_id (SoundCloud rotates it; we re-derive on 401/403).
+let cachedClientId = null;
 
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-    for (let i = start; i < html.length; i++) {
-        const c = html[i];
-        if (inStr) {
-            if (esc) esc = false;
-            else if (c === '\\') esc = true;
-            else if (c === '"') inStr = false;
-            continue;
-        }
-        if (c === '"') inStr = true;
-        else if (c === '[' || c === '{') depth++;
-        else if (c === ']' || c === '}') {
-            depth--;
-            if (depth === 0) {
-                try {
-                    return JSON.parse(html.slice(start, i + 1));
-                } catch {
-                    return null;
-                }
-            }
-        }
+async function deriveClientId() {
+    const pageRes = await fetch(SITE_BASE, { headers: { 'User-Agent': UA } });
+    if (!pageRes.ok) throw new Error('Platform lookup failed');
+    const html = await pageRes.text();
+    const bundles = [...html.matchAll(/<script[^>]+src="([^"]+sndcdn\.com[^"]+\.js)"/g)].map((m) => m[1]);
+    // client_id lives in one of the later bundles.
+    for (const url of bundles.reverse()) {
+        // eslint-disable-next-line no-await-in-loop
+        const js = await fetch(url, { headers: { 'User-Agent': UA } }).then((r) => r.text()).catch(() => '');
+        const m = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{20,})"/);
+        if (m) return m[1];
     }
-    return null;
+    throw new Error('Platform lookup failed');
+}
+
+async function getClientId(forceRefresh) {
+    if (cachedClientId && !forceRefresh) return cachedClientId;
+    cachedClientId = await deriveClientId();
+    return cachedClientId;
 }
 
 // Resolve a SoundCloud profile to:
-//   - canonical_username: the permalink slug (the only URL-addressable, and in
-//     practice stable, identifier — SoundCloud has no public numeric-id URL,
-//     so unlike YouTube's UC id we key dedup on the permalink)
+//   - canonical_username: the permalink slug (SoundCloud has no public
+//     numeric-id URL, so unlike YouTube's UC id we key dedup on the permalink)
 //   - text: username + full name + city + bio joined with newlines
 //
 // Throws:
-//   - err.code === 'CHANNEL_NOT_FOUND' if no such public profile
+//   - err.code === 'CHANNEL_NOT_FOUND' if no such public user profile
 //   - generic Error on network/parse/block issues
 async function fetchProfile(platformUsername) {
     const permalink = extractPermalink(platformUsername);
     if (!permalink) throw new Error('platform_username is required');
 
-    const res = await fetch(`${PROFILE_BASE}/${encodeURIComponent(permalink)}`, {
-        headers: { 'User-Agent': UA, Accept: 'text/html' },
-        redirect: 'follow',
-    });
+    const profileUrl = `${SITE_BASE}/${encodeURIComponent(permalink)}`;
+
+    async function resolveOnce(clientId) {
+        return fetch(
+            `${API_BASE}/resolve?url=${encodeURIComponent(profileUrl)}&client_id=${clientId}`,
+            { headers: { 'User-Agent': UA, Accept: 'application/json' } },
+        );
+    }
+
+    let clientId = await getClientId(false);
+    let res = await resolveOnce(clientId);
+    if (res.status === 401 || res.status === 403) {
+        // client_id rotated — re-derive once and retry.
+        clientId = await getClientId(true);
+        res = await resolveOnce(clientId);
+    }
+
     if (res.status === 404) {
         const err = new Error('Channel not found');
         err.code = 'CHANNEL_NOT_FOUND';
@@ -81,20 +85,19 @@ async function fetchProfile(platformUsername) {
     }
     if (!res.ok) {
         const body = await res.text().catch(() => '');
-        console.error(`[soundcloud] page error ${res.status}: ${body.slice(0, 300)}`);
+        console.error(`[soundcloud] api-v2 error ${res.status}: ${body.slice(0, 300)}`);
         throw new Error('Platform lookup failed');
     }
 
-    const html = await res.text();
-    const hydration = extractHydration(html);
-    const userEntry = Array.isArray(hydration)
-        ? hydration.find((h) => h && h.hydratable === 'user' && h.data)
-        : null;
-    const user = userEntry && userEntry.data;
+    let user;
+    try {
+        user = await res.json();
+    } catch {
+        throw new Error('Platform lookup failed');
+    }
 
-    if (!user || !user.permalink) {
-        // Page loaded but carried no user object — unknown profile, a
-        // non-user URL (track/playlist), or SoundCloud changed the markup.
+    // resolve also matches tracks/playlists — must be a user.
+    if (!user || user.kind !== 'user' || !user.permalink) {
         const err = new Error('Channel not found');
         err.code = 'CHANNEL_NOT_FOUND';
         throw err;
