@@ -26,4 +26,8 @@ module.exports = {
     COMMUNITY_SYNC_INTERVAL_H: parseInt(process.env.COMMUNITY_SYNC_INTERVAL_H) || 4,
     PROFILE_SYNC_DELAY_H: parseInt(process.env.PROFILE_SYNC_DELAY_H) || 3,
     PROFILE_SYNC_INTERVAL_H: parseInt(process.env.PROFILE_SYNC_INTERVAL_H) || 3,
+    // Pay-per-listen beneficiary account — must match the frontend's
+    // VITE_PPL_BENEFICIARY. A track is "pay-per-listen" when its Hive post
+    // routes (near) all beneficiaries here; only those get listen-tracked.
+    PPL_BENEFICIARY: process.env.PPL_BENEFICIARY || 'threespeak-audio',
 };

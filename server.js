@@ -12,6 +12,7 @@ const { startTagSyncWatcher } = require('./services/tagSync');
 const { syncAudioHiveLinks } = require('./services/audioHiveSync');
 const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
 const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
+const { schedule: scheduleAudioPayouts } = require('./services/audioPayouts');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -136,6 +137,10 @@ async function startServer() {
     // env (THREESPEAK_PRO_USERNAME + THREESPEAK_PRO_POSTING_KEY); no-op
     // and logs "disabled" when credentials aren't configured.
     scheduleCollectSubs();
+
+    // Pay-per-listen weekly payout (period ends Sun 00:00 UTC, checked every
+    // 12h with catch-up). Runs in DRY RUN until PPL_PAYOUT_ACTIVE_KEY is set.
+    scheduleAudioPayouts();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);

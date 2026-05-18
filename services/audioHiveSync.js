@@ -14,7 +14,12 @@
  */
 
 const { getDb } = require('../utils/db');
-const { ENABLE_MONGO_WRITES, HIVE_RPC_ENDPOINTS } = require('../utils/config');
+const { ENABLE_MONGO_WRITES, HIVE_RPC_ENDPOINTS, PPL_BENEFICIARY } = require('../utils/config');
+
+// A track is "pay-per-listen" when its Hive post assigns (almost) all
+// beneficiary weight to PPL_BENEFICIARY (uploader sets 10000 = 100%). We
+// accept ≥9000 to tolerate any small app/platform cut added later.
+const PPL_MIN_WEIGHT = 9000;
 
 const BATCH_SIZE = 30;
 const HIVE_POSTS_PER_USER = 20;
@@ -84,6 +89,22 @@ async function getRecentPosts(account, limit = HIVE_POSTS_PER_USER) {
         });
     }
     return posts;
+}
+
+// Is (author/permlink)'s Hive post a pay-per-listen post? Reads the stored
+// beneficiaries via get_content (persists well past payout). Returns
+// true/false, or null if we couldn't determine it (don't poison the flag).
+async function isPplPost(author, permlink) {
+    try {
+        const c = await hiveRpc('condenser_api.get_content', [author, permlink]);
+        if (!c || !Array.isArray(c.beneficiaries)) return false;
+        const total = c.beneficiaries
+            .filter(b => b && b.account === PPL_BENEFICIARY)
+            .reduce((sum, b) => sum + (Number(b.weight) || 0), 0);
+        return total >= PPL_MIN_WEIGHT;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -159,10 +180,15 @@ async function syncAudioHiveLinks() {
                         }
                     } catch { /* ignore parse errors */ }
 
+                    // Flag pay-per-listen posts so the player only opens
+                    // listen sessions for tracks that actually earn that way.
+                    const ppl = await isPplPost(match.author, match.permlink);
+                    if (ppl !== null) $set.ppl = ppl;
+
                     if (ENABLE_MONGO_WRITES) {
                         await audioCol.updateOne({ _id: audio._id }, { $set });
                     }
-                    console.log(`[audioHiveSync] Linked: ${owner}/${audio.permlink} → ${match.author}/${match.permlink}${$set.genre ? ` [genre=${$set.genre}]` : ''}`);
+                    console.log(`[audioHiveSync] Linked: ${owner}/${audio.permlink} → ${match.author}/${match.permlink}${$set.genre ? ` [genre=${$set.genre}]` : ''}${$set.ppl ? ' [PPL]' : ''}`);
                     linked++;
                 } else {
                     // Mark as checked so we don't re-process every run
