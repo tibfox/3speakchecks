@@ -578,8 +578,9 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
         const now = new Date();
         const videosCollection = db.collection('videos');
         const embedVideoCollection = db.collection('embed-video');
+        const embedAudioCollection = db.collection('embed-audio');
 
-        const [videoDoc, embedDoc] = await Promise.all([
+        const [videoDoc, embedDoc, audioDoc] = await Promise.all([
             videosCollection.findOne({ owner, permlink }),
             embedVideoCollection.findOne({
                 $or: [
@@ -587,13 +588,20 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
                     { hive_author: owner, hive_permlink: permlink },
                 ],
             }),
+            // audio is matched on its own permlink OR its linked Hive post
+            embedAudioCollection.findOne({
+                $or: [
+                    { owner, permlink },
+                    { owner, post_permlink: permlink },
+                ],
+            }),
         ]);
 
-        if (!videoDoc && !embedDoc) {
+        if (!videoDoc && !embedDoc && !audioDoc) {
             return res.status(404).json({
                 success: false,
                 error: 'Video not found',
-                message: `No video found for owner: ${owner}, permlink: ${permlink}`
+                message: `No video or audio found for owner: ${owner}, permlink: ${permlink}`
             });
         }
 
@@ -612,6 +620,13 @@ router.put('/video/thumbnail', validateApiKey, async (req, res) => {
                 { $set: { thumbnail_url: thumbnail, thumbnail_updated_at: now } }
             );
             updated.push('embed-video');
+        }
+        if (audioDoc) {
+            await embedAudioCollection.updateOne(
+                { _id: audioDoc._id },
+                { $set: { thumbnail_url: thumbnail, thumbnail_updated_at: now } }
+            );
+            updated.push('embed-audio');
         }
 
         // Log the update for audit purposes
