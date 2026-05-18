@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const { getDb } = require('../utils/db');
 const { nsfwFilter } = require('../utils/filters');
@@ -84,6 +85,267 @@ async function autoTagPermlinkFilter(db, raw) {
     }).project({ permlink: 1 }).toArray();
     return { $in: tagDocs.map(d => d.permlink) };
 }
+
+// ─── Pay-per-listen tracking ────────────────────────────────────────────────
+// A track counts as "one listen" only when ≥66% of its duration has actually
+// been *streamed* AND the listener was logged in. We do NOT trust a
+// client-reported "I listened N seconds" number (trivially forged with curl).
+// Instead:
+//   1. POST /audio/play-start  → opens a server-side session, returns an
+//      HMAC-bound token + heartbeat interval. Only a logged-in `username`
+//      makes the session payable.
+//   2. POST /audio/play-beat   → sent every ~10s while the audio is really
+//      playing. The server credits the *wall-clock gap it measures* between
+//      beats, clamped per beat — so faking one listen costs ~66% of the
+//      track's real duration of kept-alive heartbeats, not one HTTP call.
+// A credited session appends one row to `audio-listen-log`; the (future)
+// payout program reads that, weighted/filtered by account.
+const LISTEN_LOG_COLLECTION = 'audio-listen-log';
+const LISTEN_SESSION_COLLECTION = 'audio-listen-sessions';
+const LISTEN_THRESHOLD = 0.66;
+const BEAT_SECONDS = 10;
+// A single beat can credit at most this much real time (covers a slightly
+// late beat / tab throttling) — a long gap from a paused/backgrounded tab is
+// clamped, so silence is never counted.
+const MAX_BEAT_CREDIT_MS = BEAT_SECONDS * 1000 * 1.6;
+// Same listener (username, else IP) + same track within this window counts
+// as one listen — guards replays / refresh loops.
+const LISTEN_DEDUPE_MS = (parseInt(process.env.LISTEN_DEDUPE_MIN, 10) || 30) * 60 * 1000;
+// Per-process secret. Sessions live only minutes (< one track), so losing
+// them on restart is fine and we don't need a configured secret.
+const SESSION_SECRET = crypto.randomBytes(32);
+
+const HIVE_NAME_RE = /^[a-z][a-z0-9.-]{2,15}$/;
+
+// Optional, env-gated heartbeat obfuscation. When LISTEN_BEAT_KEY is set the
+// /play-beat body must be AES-256-GCM ciphertext keyed off it. NOTE: the
+// frontend key ships in the public JS bundle, so this is *obfuscation /
+// anti-casual-tampering*, NOT cryptographic protection — the real anti-forge
+// guarantee is the server-measured wall-clock between beats. Unset → plain
+// JSON beats (backward compatible).
+const LISTEN_BEAT_KEY = process.env.LISTEN_BEAT_KEY || '';
+const beatKeyBuf = LISTEN_BEAT_KEY
+    ? crypto.createHash('sha256').update(LISTEN_BEAT_KEY).digest()
+    : null;
+
+// Layout: base64( iv[12] | ciphertext | gcmTag[16] ) — matches WebCrypto's
+// AES-GCM output (tag appended to ciphertext).
+function decryptBeat(encB64) {
+    const raw = Buffer.from(String(encB64), 'base64');
+    if (raw.length < 12 + 16 + 2) throw new Error('short');
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(raw.length - 16);
+    const ct = raw.subarray(12, raw.length - 16);
+    const d = crypto.createDecipheriv('aes-256-gcm', beatKeyBuf, iv);
+    d.setAuthTag(tag);
+    const pt = Buffer.concat([d.update(ct), d.final()]);
+    return JSON.parse(pt.toString('utf8'));
+}
+
+let listenIndexesEnsured = false;
+async function ensureListenIndexes(db) {
+    if (listenIndexesEnsured) return;
+    listenIndexesEnsured = true;
+    try {
+        const log = db.collection(LISTEN_LOG_COLLECTION);
+        await log.createIndex({ username: 1, permlink: 1, createdAt: -1 }); // dedupe + payout
+        await log.createIndex({ permlink: 1, createdAt: -1 });              // per-track payout
+        await log.createIndex({ owner: 1, createdAt: -1 });                 // per-author payout
+        const sess = db.collection(LISTEN_SESSION_COLLECTION);
+        await sess.createIndex({ sid: 1 }, { unique: true });
+        await sess.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // TTL cleanup
+    } catch (err) {
+        listenIndexesEnsured = false;
+        console.error('Failed to ensure audio-listen indexes:', err.message);
+    }
+}
+
+// Real client IP — checker sits behind nginx which sets X-Real-IP /
+// X-Forwarded-For. Fall back to the socket address for direct hits.
+function clientIp(req) {
+    const xri = req.headers['x-real-ip'];
+    if (xri) return String(xri).trim();
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return String(xff).split(',')[0].trim();
+    return req.socket?.remoteAddress || req.ip || 'unknown';
+}
+
+function sessionToken(sid, permlink, ip) {
+    return crypto.createHmac('sha256', SESSION_SECRET)
+        .update(`${sid}.${permlink}.${ip}`).digest('hex');
+}
+function tokenMatches(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; }
+}
+
+// POST /audio/play-start — open a measured listen session
+// body: { permlink, username? }   (username only credited if logged in)
+router.post('/play-start', async (req, res) => {
+    try {
+        const db = getDb();
+        await ensureListenIndexes(db);
+
+        const permlink = typeof req.body?.permlink === 'string' ? req.body.permlink.trim() : '';
+        if (!permlink || permlink.length > 256) {
+            return res.status(400).json({ error: 'Invalid permlink' });
+        }
+        const rawName = typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase() : '';
+        const username = HIVE_NAME_RE.test(rawName) ? rawName : null;
+
+        const track = await db.collection('embed-audio').findOne(
+            { permlink },
+            { projection: { owner: 1, post_permlink: 1, duration: 1, ppl: 1 } }
+        );
+        if (!track) return res.status(404).json({ error: 'Unknown track' });
+
+        // Only pay-per-listen tracks are worth a session. Non-PPL (or
+        // not-yet-link-resolved) tracks: tell the client not to track —
+        // saves the play-start follow-ups and all heartbeats.
+        if (track.ppl !== true) {
+            return res.json({ payable: false, ppl: false });
+        }
+
+        // Self-listen guard: an author streaming their own PPL track must
+        // never earn from it (self-dealing). No session → no heartbeats,
+        // no log row.
+        if (username && track.owner && username === track.owner) {
+            return res.json({ payable: false, ppl: true, reason: 'self' });
+        }
+
+        const duration = Number(track.duration);
+        if (!Number.isFinite(duration) || duration <= 0) {
+            return res.status(422).json({ error: 'Track has no duration' });
+        }
+
+        const sid = crypto.randomBytes(16).toString('hex');
+        const ip = clientIp(req);
+        const durationMs = Math.round(duration * 1000);
+        const now = new Date();
+
+        await db.collection(LISTEN_SESSION_COLLECTION).insertOne({
+            sid,
+            permlink,
+            owner: track.owner || null,
+            post_permlink: track.post_permlink || null,
+            durationMs,
+            ip,
+            username,            // null → session can never be credited
+            paid: !!username,
+            accumulatedMs: 0,
+            credited: false,
+            startedAt: now,
+            lastBeatAt: now,
+            // Generous TTL: a few track-lengths so a paused tab can resume.
+            expiresAt: new Date(Date.now() + durationMs * 4 + 5 * 60 * 1000),
+        });
+
+        res.json({
+            sid,
+            token: sessionToken(sid, permlink, ip),
+            beatSeconds: BEAT_SECONDS,
+            threshold: LISTEN_THRESHOLD,
+            payable: !!username,
+            encrypted: !!beatKeyBuf,
+        });
+    } catch (error) {
+        console.error('Error starting listen session:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// POST /audio/play-beat — heartbeat while the audio is really playing
+// body: { sid, token }  — or { enc } when LISTEN_BEAT_KEY is set
+router.post('/play-beat', async (req, res) => {
+    try {
+        const db = getDb();
+
+        let sid, token;
+        if (beatKeyBuf) {
+            if (typeof req.body?.enc !== 'string') {
+                return res.status(400).json({ error: 'encryption_required' });
+            }
+            try {
+                const dec = decryptBeat(req.body.enc);
+                sid = typeof dec?.sid === 'string' ? dec.sid : '';
+                token = typeof dec?.token === 'string' ? dec.token : '';
+            } catch {
+                return res.status(400).json({ error: 'bad_ciphertext' });
+            }
+        } else {
+            sid = typeof req.body?.sid === 'string' ? req.body.sid : '';
+            token = typeof req.body?.token === 'string' ? req.body.token : '';
+        }
+        if (!sid || !token) return res.status(400).json({ error: 'Invalid beat' });
+
+        const sessions = db.collection(LISTEN_SESSION_COLLECTION);
+        const s = await sessions.findOne({ sid });
+        if (!s) return res.status(410).json({ error: 'no_session' });
+
+        // Token is bound to the session's permlink + the IP seen at start —
+        // a sid alone can't be replayed against another track.
+        if (!tokenMatches(token, sessionToken(sid, s.permlink, s.ip))) {
+            return res.status(403).json({ error: 'bad_token' });
+        }
+        if (s.credited) {
+            return res.json({ progress: 1, credited: true, done: true });
+        }
+
+        const now = Date.now();
+        const gap = Math.max(0, now - new Date(s.lastBeatAt).getTime());
+        // The crux: credit only the real elapsed time between beats, capped
+        // so one delayed/forged beat can't claim a huge span.
+        const credit = Math.min(gap, MAX_BEAT_CREDIT_MS);
+        const accumulatedMs = s.accumulatedMs + credit;
+        const qualifies = s.paid && s.username
+            && accumulatedMs >= s.durationMs * LISTEN_THRESHOLD;
+
+        let credited = false;
+        if (qualifies) {
+            // Atomically claim the credit exactly once for this session.
+            const claim = await sessions.findOneAndUpdate(
+                { sid, credited: { $ne: true } },
+                { $set: { credited: true, accumulatedMs, lastBeatAt: new Date(now) } }
+            );
+            const won = claim?.value !== undefined ? claim.value : claim;
+            if (won) {
+                credited = true;
+                const log = db.collection(LISTEN_LOG_COLLECTION);
+                const dupe = await log.findOne({
+                    username: s.username,
+                    permlink: s.permlink,
+                    createdAt: { $gt: new Date(now - LISTEN_DEDUPE_MS) },
+                }, { projection: { _id: 1 } });
+                if (!dupe) {
+                    await log.insertOne({
+                        ip: s.ip,
+                        username: s.username,
+                        permlink: s.permlink,
+                        owner: s.owner,
+                        post_permlink: s.post_permlink,
+                        listenedSeconds: Math.round(accumulatedMs / 1000),
+                        trackDuration: Math.round(s.durationMs / 1000),
+                        createdAt: new Date(now),
+                    });
+                }
+            }
+        } else {
+            await sessions.updateOne(
+                { sid },
+                { $set: { accumulatedMs, lastBeatAt: new Date(now) } }
+            );
+        }
+
+        res.json({
+            progress: Math.min(1, accumulatedMs / s.durationMs),
+            credited,
+            done: credited,
+        });
+    } catch (error) {
+        console.error('Error recording listen beat:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 // GET /audio — list audio with optional filters
 router.get('/', async (req, res) => {
@@ -514,6 +776,134 @@ router.get('/creators', async (req, res) => {
         });
     } catch (error) {
         console.error('Error fetching audio creators:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Playlist `metadata` is stored as JSON (json.RawMessage) — via the Node
+// driver it can arrive as an object, a BSON Binary, or a base64 string.
+function decodePlaylistMeta(m) {
+    try {
+        if (!m) return null;
+        if (typeof m === 'object' && m._bsontype === 'Binary') return JSON.parse(m.buffer.toString('utf8'));
+        if (Buffer.isBuffer(m)) return JSON.parse(m.toString('utf8'));
+        if (typeof m === 'string') {
+            // Could be raw JSON or base64-encoded JSON.
+            try { return JSON.parse(m); } catch { return JSON.parse(Buffer.from(m, 'base64').toString('utf8')); }
+        }
+        if (typeof m === 'object') return m;
+    } catch { /* ignore */ }
+    return null;
+}
+
+// GET /audio/playlists — public playlists that contain music, split into:
+//   by_artist    → every track is by the playlist creator
+//   by_listeners → contains at least one track by someone else
+router.get('/playlists', async (req, res) => {
+    try {
+        const db = getDb();
+        const perGroup = Math.min(Math.max(parseInt(req.query.limit) || 24, 1), 60);
+
+        // Recent public playlists that actually have items.
+        const candidates = await db.collection('playlists').find({
+            access: 'public',
+            owner: { $type: 'string', $ne: '' },
+            'items.0': { $exists: true },
+        }).sort({ last_modified_block: -1, _id: -1 }).limit(400).toArray();
+
+        if (candidates.length === 0) return res.json({ by_artist: [], by_listeners: [] });
+
+        // Resolve which (author, permlink) pairs are audio tracks in one query.
+        // Apply the SAME content filters as the audio page so filtering by
+        // e.g. category "Music" keeps albums whose tracks match.
+        const permlinks = [...new Set(candidates.flatMap(p => (p.items || []).map(i => i.permlink)))];
+        const audioQuery = { post_permlink: { $in: permlinks }, status: 'published' };
+        applyCategoryFilter(audioQuery, req.query.category);
+        if (req.query.genre) {
+            const g = String(req.query.genre).trim();
+            if (g) {
+                const esc = g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const rx = new RegExp(`^${esc}$`, 'i');
+                audioQuery.$and = (audioQuery.$and || []).concat([{ $or: [{ genre: rx }, { tags: rx }] }]);
+            }
+        }
+        if (req.query.q) {
+            const s = String(req.query.q).trim();
+            audioQuery.$and = (audioQuery.$and || []).concat([
+                { $or: [
+                    { title: { $regex: s, $options: 'i' } },
+                    { owner: { $regex: s, $options: 'i' } },
+                ] },
+            ]);
+        }
+        const audioDocs = await db.collection('embed-audio').find(
+            audioQuery,
+            { projection: { owner: 1, permlink: 1, post_permlink: 1, title: 1, thumbnail_url: 1, duration: 1, audio_cid: 1, category: 1 } },
+        ).toArray();
+        const audioByKey = new Map();
+        for (const a of audioDocs) audioByKey.set(`${a.owner}|${a.post_permlink}`, a);
+
+        const by_artist = [];
+        const by_listeners = [];
+
+        for (const p of candidates) {
+            const items = p.items || [];
+            const audioItems = items.filter(it => audioByKey.has(`${it.author}|${it.permlink}`));
+            if (audioItems.length === 0) continue; // not a music playlist
+
+            // User's rule: only the creator's tracks → by artist; any track
+            // from someone else → by listeners.
+            const onlyCreator = items.every(it => it.author === p.owner);
+            const meta = decodePlaylistMeta(p.metadata);
+            // Full ordered, playable track list (embed-audio doc shape the
+            // audio player/queue expects) — ordered by playlist position.
+            const tracks = audioItems
+                .slice()
+                .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+                .slice(0, 200)
+                .map(it => {
+                    const a = audioByKey.get(`${it.author}|${it.permlink}`);
+                    return {
+                        _id: String(a._id),
+                        owner: a.owner,
+                        permlink: a.permlink,
+                        post_permlink: a.post_permlink,
+                        title: a.title,
+                        audio_cid: a.audio_cid,
+                        thumbnail_url: a.thumbnail_url || null,
+                        duration: a.duration,
+                        category: a.category || null,
+                    };
+                });
+            // Cover priority: playlist's own image → album meta → any track
+            // art → the creator's Hive avatar (never empty).
+            const thumbnail = p.thumbnail
+                || meta?.album?.thumbnail
+                || tracks.find(t => t.thumbnail_url)?.thumbnail_url
+                || `https://images.hive.blog/u/${p.owner}/avatar`;
+
+            const entry = {
+                id: String(p._id),
+                name: p.name || 'Untitled playlist',
+                owner: p.owner,
+                thumbnail,
+                trackCount: tracks.length,
+                totalItems: items.length,
+                artists: [...new Set(items.map(it => it.author))].slice(0, 6),
+                album: meta?.album || null,
+                tracks,
+                updatedAt: p.updated_at || p.created_at || null,
+            };
+            (onlyCreator ? by_artist : by_listeners).push(entry);
+        }
+
+        const sortRecent = (a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
+        res.json({
+            by_artist: by_artist.sort(sortRecent).slice(0, perGroup),
+            by_listeners: by_listeners.sort(sortRecent).slice(0, perGroup),
+        });
+    } catch (error) {
+        console.error('Error fetching audio playlists:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

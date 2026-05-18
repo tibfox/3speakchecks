@@ -10,6 +10,9 @@ const { syncHiveProfiles } = require('./services/profileSync');
 const { denormalizeCommunityTitles } = require('./services/communityDenorm');
 const { startTagSyncWatcher } = require('./services/tagSync');
 const { syncAudioHiveLinks } = require('./services/audioHiveSync');
+const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
+const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
+const { schedule: scheduleAudioPayouts } = require('./services/audioPayouts');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -20,6 +23,7 @@ const shortsRoutes = require('./routes/shorts');
 const audioRoutes = require('./routes/audio');
 const feedsRoutes = require('./routes/feeds');
 const rssRoutes = require('./routes/rss');
+const verifyRoutes = require('./routes/verify');
 
 const app = express();
 
@@ -40,6 +44,7 @@ app.use('/', shortsRoutes);
 app.use('/audio', audioRoutes);
 app.use('/feeds', feedsRoutes);
 app.use('/rss', rssRoutes);
+app.use('/verify', verifyRoutes);
 
 // Track whether heavy sync tasks are running
 let syncRunning = false;
@@ -116,6 +121,28 @@ async function startServer() {
         }, 30 * 60 * 1000);
     }, 2 * 60 * 1000);
     console.log('Audio-Hive link sync scheduled every 30min (first run in 2min)');
+
+    // Sync VSC subscription status → embed-users.premium. Runs on a
+    // tight 60s cadence so the 1-day pass expires within ±1min of its
+    // 24h window. Source of truth is the Okinoko Hasura indexer; worker
+    // only touches rows tagged premium_source='subs' on demote so
+    // manual upgrades stay sticky.
+    setTimeout(() => {
+        syncPremiumFromSubs().catch(err => console.error('Premium subs sync error:', err));
+        setInterval(() => {
+            syncPremiumFromSubs().catch(err => console.error('Premium subs sync error:', err));
+        }, 60 * 1000);
+    }, 30 * 1000);
+    console.log('Premium subs sync scheduled every 60s (first run in 30s)');
+
+    // Periodic collect_subscriptions for the Pro contract. Self-gated on
+    // env (THREESPEAK_PRO_USERNAME + THREESPEAK_PRO_POSTING_KEY); no-op
+    // and logs "disabled" when credentials aren't configured.
+    scheduleCollectSubs();
+
+    // Pay-per-listen weekly payout (period ends Sun 00:00 UTC, checked every
+    // 12h with catch-up). Runs in DRY RUN until PPL_PAYOUT_ACTIVE_KEY is set.
+    scheduleAudioPayouts();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);

@@ -1,7 +1,22 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
+const parseBool = (v, fallback) => {
+    if (v === undefined || v === null || v === '') return fallback;
+    return String(v).toLowerCase() === 'true';
+};
+
 module.exports = {
+    // ─── Social-link verifier (merged from mantequilla-social-verifier) ───
+    SOCIAL_LINKS_COLLECTION: process.env.SOCIAL_LINKS_COLLECTION || 'social_links',
+    YOUTUBE_API_KEY: process.env.YOUTUBE_API_KEY || '',
+    HIVE_AUTH_REQUIRED: parseBool(process.env.HIVE_AUTH_REQUIRED, true),
+    SIGNATURE_TIMESTAMP_TOLERANCE_MS: parseInt(process.env.SIGNATURE_TIMESTAMP_TOLERANCE_MS) || 5 * 60 * 1000,
+    MAX_LINKS_PER_USER: parseInt(process.env.MAX_LINKS_PER_USER) || 25,
+    UNVERIFIED_TTL_DAYS: parseInt(process.env.UNVERIFIED_TTL_DAYS) || 3,
+    RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+    RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX) || 10,
+
     PORT: process.env.PORT || 3000,
     MONGODB_URI: process.env.MONGODB_URI,
     DATABASE_NAME: process.env.DATABASE_NAME || 'threespeak',
@@ -26,4 +41,8 @@ module.exports = {
     COMMUNITY_SYNC_INTERVAL_H: parseInt(process.env.COMMUNITY_SYNC_INTERVAL_H) || 4,
     PROFILE_SYNC_DELAY_H: parseInt(process.env.PROFILE_SYNC_DELAY_H) || 3,
     PROFILE_SYNC_INTERVAL_H: parseInt(process.env.PROFILE_SYNC_INTERVAL_H) || 3,
+    // Pay-per-listen beneficiary account — must match the frontend's
+    // VITE_PPL_BENEFICIARY. A track is "pay-per-listen" when its Hive post
+    // routes (near) all beneficiaries here; only those get listen-tracked.
+    PPL_BENEFICIARY: process.env.PPL_BENEFICIARY || 'threespeak-audio',
 };
