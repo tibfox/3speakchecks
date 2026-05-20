@@ -59,11 +59,17 @@ async function fetchHiveRewards(authorPerms) {
         }
     }
 
+    // Build all batches up front, then fire them in parallel — was sequential
+    // (await inside the for-loop), which made the cold-cache trending feed
+    // O(N/20) Hive roundtrips instead of one wall-clock roundtrip.
+    const batches = [];
     for (let i = 0; i < toFetch.length; i += 20) {
-        const batch = toFetch.slice(i, i + 20);
-        const rpcBatch = batch.map((item, idx) => ({
+        batches.push({ offset: i, items: toFetch.slice(i, i + 20) });
+    }
+    await Promise.all(batches.map(async ({ offset, items }) => {
+        const rpcBatch = items.map((item, idx) => ({
             jsonrpc: '2.0',
-            id: i + idx,
+            id: offset + idx,
             method: 'condenser_api.get_content',
             params: [item.author, item.permlink]
         }));
@@ -96,12 +102,12 @@ async function fetchHiveRewards(authorPerms) {
             }
         }
 
-        for (const item of batch) {
+        for (const item of items) {
             if (!results.has(item.key)) {
                 results.set(item.key, { reward: 0, title: '', body: '', tags: [] });
             }
         }
-    }
+    }));
 
     return results;
 }

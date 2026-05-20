@@ -264,10 +264,18 @@ router.get('/trendingSorted', async (req, res) => {
             .filter(v => (v.author || v.owner) && v.permlink)
             .map(v => ({ author: v.author || v.owner, permlink: v.permlink }));
 
-        let legacyHiveData = new Map();
-        if (legacyAuthorPerms.length > 0) {
-            legacyHiveData = await fetchHiveRewards(legacyAuthorPerms);
-        }
+        // Embed candidates' Hive author/permlink (already on the doc).
+        const embedAuthorPerms = embedCandidatesRaw
+            .filter(ev => ev.hive_author && ev.hive_permlink)
+            .map(ev => ({ author: ev.hive_author, permlink: ev.hive_permlink }));
+
+        // Both Hive-rewards lookups can run in parallel — they don't depend
+        // on each other. Combined with the inner batch parallelisation in
+        // fetchHiveRewards, this is now ~1 RPC roundtrip instead of ~20.
+        const [legacyHiveData, embedHiveData] = await Promise.all([
+            legacyAuthorPerms.length > 0 ? fetchHiveRewards(legacyAuthorPerms) : Promise.resolve(new Map()),
+            embedAuthorPerms.length > 0 ? fetchHiveRewards(embedAuthorPerms) : Promise.resolve(new Map()),
+        ]);
 
         // Recalculate base_score for legacy videos with live reward data
         for (const video of legacyCandidates) {
@@ -275,16 +283,6 @@ router.get('/trendingSorted', async (req, res) => {
             const hive = legacyHiveData.get(hiveKey);
             const liveReward = hive ? (hive.reward || 0) : 0;
             video.base_score = (video.base_score || 0) + liveReward * TRENDING_REWARD_WEIGHT;
-        }
-
-        // Enrich embed videos with Hive data for scoring
-        const embedAuthorPerms = embedCandidatesRaw
-            .filter(ev => ev.hive_author && ev.hive_permlink)
-            .map(ev => ({ author: ev.hive_author, permlink: ev.hive_permlink }));
-
-        let embedHiveData = new Map();
-        if (embedAuthorPerms.length > 0) {
-            embedHiveData = await fetchHiveRewards(embedAuthorPerms);
         }
 
         // Transform embed videos into candidate format matching legacy videos

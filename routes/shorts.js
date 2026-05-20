@@ -360,8 +360,14 @@ router.get('/shortssorted', async (req, res) => {
         const skip = (page - 1) * limit;
         const appFilter = req.query.app; // optional frontend_app filter
         const currentuser = req.query.currentuser; // optional: filter out shorts this user already watched
-        // Seed for deterministic shuffle - use provided seed or generate one
-        const seed = req.query.seed ? parseInt(req.query.seed) : Math.floor(Math.random() * 2147483647);
+        // Seed for deterministic shuffle. When the client doesn't supply one
+        // we bucket by 5-minute window — same seed for everyone inside the
+        // window so the sorted-list cache actually hits (was a fresh random
+        // per request → cache miss every call, the full pipeline re-ran).
+        const SEED_BUCKET_MS = 5 * 60 * 1000;
+        const seed = req.query.seed
+            ? parseInt(req.query.seed)
+            : Math.floor(Date.now() / SEED_BUCKET_MS);
 
         // Check sorted list cache (keyed by seed+app, stores only lightweight identifiers)
         const cacheKey = `${seed}|${appFilter || 'all'}`;
