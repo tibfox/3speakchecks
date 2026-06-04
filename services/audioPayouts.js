@@ -1,23 +1,25 @@
 /**
  * Pay-per-listen payout worker.
  *
- * Once per week (period ends Sunday 00:00 UTC) the liquid HBD + HIVE balance
- * of the PPL_BENEFICIARY account is distributed over every qualifying listen
- * in `audio-listen-log` from the trailing 7 days. Each listen's value is
- * split between the track's author (owner) and the listener (username) by
- * PPL_AUTHOR_SHARE (default 0.5; listener gets 1 - that).
+ * Once per month (period = the previous calendar month, boundaries on the 1st
+ * at 00:00 UTC) the liquid HBD + HIVE balance of the PPL_BENEFICIARY account is
+ * distributed over every qualifying listen in `audio-listen-log` from that
+ * month. The longer period lets the beneficiary account accumulate funds before
+ * each payout. Each listen's value is split between the track's author (owner)
+ * and the listener (username) by PPL_AUTHOR_SHARE (default 0.5; listener gets
+ * 1 - that).
  *
  * Scheduling: a check runs every PPL_PAYOUT_CHECK_HOURS (default 12h). It
- * looks at the most recent Sunday-00:00-UTC boundary; if no payout has been
- * recorded for that period it runs one — so a missed Sunday is caught up on
- * the next check.
+ * looks at the most recent month-start (1st, 00:00 UTC) boundary; if no payout
+ * has been recorded for that period it runs one — so a missed month is caught
+ * up on the next check.
  *
  * Money-safety:
  *  - No PPL_PAYOUT_ACTIVE_KEY (or PPL_PAYOUT_DRY_RUN=true) → DRY RUN: the
  *    plan is computed/logged but nothing is broadcast and no period claim is
- *    written, so a real run still happens later for that week.
+ *    written, so a real run still happens later for that period.
  *  - A unique index on `periodEnd` + an in-progress claim row makes
- *    double-paying a week impossible even if checks overlap.
+ *    double-paying a period impossible even if checks overlap.
  *  - A crashed/partial payout is left status:'error' and is NOT auto-retried
  *    (retrying could double-pay early recipients) — needs manual review.
  *  - Transfers are irreversible; per-recipient failures are recorded and the
@@ -46,9 +48,9 @@ const CHECK_HOURS = Math.max(1, parseFloat(process.env.PPL_PAYOUT_CHECK_HOURS ||
 const CHECK_MS = CHECK_HOURS * 60 * 60 * 1000;
 // Hive transfer precision is 0.001; anything below rounds to nothing.
 const MIN_AMOUNT = Math.max(0.001, parseFloat(process.env.PPL_PAYOUT_MIN || '0.001'));
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 // Optional one-off / testing override: pin the period end to a specific
-// instant instead of "last Sunday 00:00 UTC". Window stays [end-7d, end).
+// instant instead of the current month-start. Window is the calendar month
+// immediately before periodEnd.
 const PERIOD_END_OVERRIDE = (process.env.PPL_PAYOUT_PERIOD_END || '').trim();
 
 let hiveClient = null;
@@ -63,11 +65,17 @@ const floor3 = (n) => Math.floor(n * 1000) / 1000;
 const fmt3 = (n) => n.toFixed(3);
 const parseAmt = (s) => parseFloat(String(s || '0').trim().split(' ')[0]) || 0;
 
-// Most recent Sunday 00:00:00 UTC at or before `now`.
-function lastSundayBoundary(now = new Date()) {
-    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    d.setUTCDate(d.getUTCDate() - d.getUTCDay()); // getUTCDay(): 0 = Sunday
-    return d;
+// First day of the current month, 00:00:00 UTC (most recent month boundary).
+function lastMonthBoundary(now = new Date()) {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+}
+// Exactly one calendar month before `periodEnd` (Date.UTC normalises the month
+// underflow, e.g. Jan → previous Dec).
+function monthBefore(periodEnd) {
+    return new Date(Date.UTC(
+        periodEnd.getUTCFullYear(), periodEnd.getUTCMonth() - 1, periodEnd.getUTCDate(),
+        periodEnd.getUTCHours(), periodEnd.getUTCMinutes(), periodEnd.getUTCSeconds(),
+    ));
 }
 
 async function accountsExist(names) {
@@ -83,14 +91,14 @@ async function accountsExist(names) {
 }
 
 /**
- * Compute + (optionally) execute the payout for the week ending `periodEnd`.
+ * Compute + (optionally) execute the payout for the month ending `periodEnd`.
  */
 async function runPayout(now = new Date()) {
     const db = getDb();
     const col = db.collection(PAYOUT_COLLECTION);
     // Unique only over real period rows (periodEnd is a Date). The singleton
     // dry-run preview deliberately has no Date periodEnd so it never occupies
-    // — or blocks — a week's claim slot.
+    // — or blocks — a period's claim slot.
     await col.createIndex(
         { periodEnd: 1 },
         { unique: true, partialFilterExpression: { periodEnd: { $type: 'date' } } },
@@ -98,13 +106,13 @@ async function runPayout(now = new Date()) {
     await db.collection(LISTEN_LOG_COLLECTION)
         .createIndex({ paid: 1, createdAt: 1 }).catch(() => {});
 
-    let periodEnd = lastSundayBoundary(now);
+    let periodEnd = lastMonthBoundary(now);
     if (PERIOD_END_OVERRIDE) {
         const o = new Date(PERIOD_END_OVERRIDE);
         if (!isNaN(o.getTime())) periodEnd = o;
-        else console.error(`[pplPayout] PPL_PAYOUT_PERIOD_END="${PERIOD_END_OVERRIDE}" is not a valid date — using Sunday boundary.`);
+        else console.error(`[pplPayout] PPL_PAYOUT_PERIOD_END="${PERIOD_END_OVERRIDE}" is not a valid date — using month boundary.`);
     }
-    const periodStart = new Date(periodEnd.getTime() - WEEK_MS);
+    const periodStart = monthBefore(periodEnd);
     const tag = periodEnd.toISOString().slice(0, 10);
     const dryRun = FORCE_DRY_RUN || !ACTIVE_KEY;
 
@@ -126,8 +134,12 @@ async function runPayout(now = new Date()) {
     // double payout impossible even if windows ever overlap or a run is
     // re-triggered manually.
     const listenCol = db.collection(LISTEN_LOG_COLLECTION);
+    // payable: { $ne: false } excludes anonymous/non-payable rows (e.g. the
+    // snapieaudio player now logs every play here for reporting) while still
+    // including legacy rows that predate the field. Without it the owner would
+    // be credited for anonymous plays.
     const listens = await listenCol
-        .find({ createdAt: { $gte: periodStart, $lt: periodEnd }, paid: { $ne: true } })
+        .find({ createdAt: { $gte: periodStart, $lt: periodEnd }, paid: { $ne: true }, payable: { $ne: false } })
         .project({ owner: 1, username: 1 })
         .toArray();
 
@@ -174,7 +186,7 @@ async function runPayout(now = new Date()) {
     for (const [account, w] of weight) {
         const hbd = floor3((w / totalWeight) * hbdPool);
         const hive = floor3((w / totalWeight) * hivePool);
-        if (hbd < MIN_AMOUNT && hive < MIN_AMOUNT) continue; // dust → rolls to next week
+        if (hbd < MIN_AMOUNT && hive < MIN_AMOUNT) continue; // dust → rolls to next month
         plan.push({ account, weight: w, hbd, hive });
     }
 
@@ -282,7 +294,7 @@ async function runPayout(now = new Date()) {
         const perListenHbd = floor3(hbdPool / totalWeight);
         const perListenHive = floor3(hivePool / totalWeight);
         const upd = await listenCol.updateMany(
-            { createdAt: { $gte: periodStart, $lt: periodEnd }, paid: { $ne: true } },
+            { createdAt: { $gte: periodStart, $lt: periodEnd }, paid: { $ne: true }, payable: { $ne: false } },
             { $set: {
                 paid: true,
                 paidAt: new Date(),
@@ -316,7 +328,7 @@ function schedule() {
     }
     const mode = (ACTIVE_KEY && !FORCE_DRY_RUN) ? 'LIVE' : 'DRY RUN';
     console.log(
-        `[pplPayout] scheduled — checking every ${CHECK_HOURS}h, weekly period ends Sun 00:00 UTC, ` +
+        `[pplPayout] scheduled — checking every ${CHECK_HOURS}h, monthly period (previous calendar month), ` +
         `source @${SOURCE_ACCOUNT}, author/listener ${AUTHOR_SHARE}/${LISTENER_SHARE} [${mode}] (first check in 1min)`,
     );
     setTimeout(() => {
@@ -327,4 +339,4 @@ function schedule() {
     }, 60 * 1000);
 }
 
-module.exports = { schedule, runPayout, lastSundayBoundary };
+module.exports = { schedule, runPayout, lastMonthBoundary };

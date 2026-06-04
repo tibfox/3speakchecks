@@ -325,7 +325,9 @@ router.post('/play-beat', async (req, res) => {
                         post_permlink: s.post_permlink,
                         listenedSeconds: Math.round(accumulatedMs / 1000),
                         trackDuration: Math.round(s.durationMs / 1000),
+                        payable: true, // payout-eligible; snapieaudio writes payable:false for anon plays
                         createdAt: new Date(now),
+                        listenDate: new Date(now).toISOString().slice(0, 10), // UTC YYYY-MM-DD
                     });
                 }
             }
