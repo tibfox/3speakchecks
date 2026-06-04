@@ -512,7 +512,19 @@ router.post('/views', async (req, res) => {
                         results[key] = views;
                         setCachedViews(key, views);
                     } else {
-                        results[key] = null;
+                        // Embed videos aren't in the legacy `videos` collection — their
+                        // view count lives in `embed-video`, keyed by hive author/permlink.
+                        const embed = await db.collection('embed-video').findOne(
+                            { hive_author: author, hive_permlink: permlink },
+                            { projection: { views: 1 } }
+                        );
+                        if (embed) {
+                            const views = embed.views ?? 0;
+                            results[key] = views;
+                            setCachedViews(key, views);
+                        } else {
+                            results[key] = null;
+                        }
                     }
                 } catch (err) {
                     console.error(`Error fetching views for ${key}:`, err.message);
