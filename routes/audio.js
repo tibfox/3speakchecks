@@ -589,12 +589,55 @@ router.get('/grouped', async (req, res) => {
             }
         }));
 
-        // Also fetch "popular" (most played) across all categories
+        // Also fetch "popular" (most played) across all categories. Constrained
+        // to a recent window so the row reflects what's popular *now* — without
+        // it, old tracks with years of accumulated plays dominated and crowded
+        // out fresh content. Honors a tighter caller-supplied `from` filter.
+        const POPULAR_WINDOW_DAYS = 60;
+        // Extra weight for brand-new audio: the score is multiplied by up to
+        // (1 + POPULAR_RECENCY_BOOST) at age 0, decaying linearly to ×1 at
+        // POPULAR_BOOST_DAYS, then flat. So a fresh track needs far fewer plays
+        // to surface than an older one in the window.
+        const POPULAR_BOOST_DAYS = 7;
+        const POPULAR_RECENCY_BOOST = 3;
+        const popularWindowStart = new Date(Date.now() - POPULAR_WINDOW_DAYS * 86400000);
+        const callerFrom = baseMatch.createdAt?.$gte;
+        const popularMatch = {
+            ...baseMatch,
+            plays: { $gt: 0 },
+            createdAt: { $gte: callerFrom && callerFrom > popularWindowStart ? callerFrom : popularWindowStart },
+        };
         const popular = await audioCollection.aggregate([
-            { $match: { ...baseMatch, plays: { $gt: 0 } } },
-            { $sort: { plays: -1 } },
+            { $match: popularMatch },
+            {
+                $addFields: {
+                    _ageDays: { $divide: [{ $subtract: ['$$NOW', '$createdAt'] }, 86400000] },
+                },
+            },
+            {
+                $addFields: {
+                    _score: {
+                        $multiply: [
+                            { $ifNull: ['$plays', 0] },
+                            {
+                                $add: [
+                                    1,
+                                    {
+                                        $multiply: [
+                                            POPULAR_RECENCY_BOOST,
+                                            { $max: [0, { $divide: [{ $subtract: [POPULAR_BOOST_DAYS, '$_ageDays'] }, POPULAR_BOOST_DAYS] }] },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            },
+            { $sort: { _score: -1, createdAt: -1 } },
             { $limit: perGroup },
-            ...subtitleJoin
+            ...subtitleJoin,
+            { $project: { _ageDays: 0, _score: 0 } },
         ]).toArray();
         if (popular.length > 0) {
             groups.popular = popular;

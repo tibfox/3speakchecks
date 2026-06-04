@@ -550,4 +550,197 @@ router.get('/firstUploads', async (req, res) => {
     }
 });
 
+/* ─── Community feeds ─────────────────────────────────────────────────
+ * Replacements for the legacy `${LEGACY}/apiv2/feeds/community/:id/...`
+ * endpoints. Same shape as /new and /trending, scoped to one community.
+ *
+ * `videos.community` is the community id (e.g. "hive-181335") on the legacy
+ * indexer. For freshly uploaded embed videos the community id lands in
+ * `hive_tags` (as the post's first tag), so we filter on that.
+ * ──────────────────────────────────────────────────────────────────── */
+
+// Translate an embed-video doc into the same shape /new / /firstUploads return.
+// Mirrors the inline transform those routes already do — kept inline here too
+// so it stays trivial to grep for and tweak alongside the others.
+function transformEmbedVideoToLegacy(ev) {
+    return {
+        owner: ev.owner,
+        author: ev.hive_author,
+        permlink: ev.hive_permlink,
+        title: ev.hive_title || ev.originalFilename || '',
+        body: ev.hive_body || '',
+        status: 'published',
+        created: ev.createdAt,
+        created_at: ev.createdAt,
+        views: ev.views || 0,
+        duration: ev.duration || 0,
+        tags: ev.hive_tags || [],
+        tags_v2: (ev.hive_tags || []).map(t => t.toLowerCase()),
+        images: {
+            thumbnail: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/thumbnail.png`,
+            poster: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/poster.jpg`,
+        },
+        spkvideo: {
+            duration: ev.duration || 0,
+            video_v2: ev.permlink,
+            play_url: ev.manifest_cid ? `https://ipfs.3speak.tv/ipfs/${ev.manifest_cid}` : null,
+        },
+        _source: 'embed',
+        _sortDate: new Date(ev.createdAt || 0).getTime(),
+    };
+}
+
+function validateCommunityId(id) {
+    return /^hive-\d+$/.test(String(id || '').trim());
+}
+
+router.get('/community/:id/new', async (req, res) => {
+    try {
+        const communityId = String(req.params.id || '').trim();
+        if (!validateCommunityId(communityId)) {
+            return res.status(400).json({ success: false, error: 'community id must look like "hive-<digits>"' });
+        }
+
+        const db = getDb();
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        const embedVideoCollection = db.collection('embed-video');
+
+        const [legacyVideos, embedVideosRaw] = await Promise.all([
+            videosCollection.find({
+                status: 'published',
+                owner: { $nin: HIDDEN_AUTHORS },
+                publishFailed: { $ne: true },
+                community: communityId,
+                ...nsfwFilterTags(req),
+            }).sort({ created: -1 }).limit(limit + skip).toArray(),
+            embedVideoCollection.find({
+                status: 'published',
+                short: false,
+                listed_on_3speak: true,
+                hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
+                hive_permlink: { $ne: null },
+                hive_tags: communityId,
+                ...nsfwFilterHiveTags(req),
+            }).sort({ createdAt: -1 }).limit(limit + skip).toArray(),
+        ]);
+
+        const embedVideos = embedVideosRaw.map(transformEmbedVideoToLegacy);
+        const legacyWithDate = legacyVideos.map(v => ({
+            ...v,
+            _sortDate: new Date(v.created || v.created_at || 0).getTime(),
+        }));
+
+        // Dedup: drop embed entries that already exist in the legacy index.
+        const legacyKeys = new Set(legacyWithDate.map(v => `${v.author || v.owner}/${v.permlink}`));
+        const uniqueEmbed = embedVideos.filter(ev => !legacyKeys.has(`${ev.author}/${ev.permlink}`));
+
+        const allVideos = [...legacyWithDate, ...uniqueEmbed].sort((a, b) => b._sortDate - a._sortDate);
+        const total = allVideos.length;
+        const totalPages = Math.ceil(total / limit);
+        const videos = allVideos.slice(skip, skip + limit);
+        videos.forEach(v => { delete v._sortDate; delete v._source; });
+
+        res.json({
+            success: true,
+            feed: 'community-new',
+            community: communityId,
+            page, limit, total, totalPages,
+            videos,
+        });
+    } catch (error) {
+        console.error('Error fetching community new feed:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+router.get('/community/:id/trending', async (req, res) => {
+    try {
+        const communityId = String(req.params.id || '').trim();
+        if (!validateCommunityId(communityId)) {
+            return res.status(400).json({ success: false, error: 'community id must look like "hive-<digits>"' });
+        }
+
+        const db = getDb();
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const videosCollection = db.collection('videos');
+        const embedVideoCollection = db.collection('embed-video');
+
+        // "Trending" = most-viewed videos in the community *within a recent
+        // window* (vs /new which ranks the same recent window by date). The old
+        // `trending: true` flag is never set on embed videos, so an embed-based
+        // community's trending row was identical to /new. Ranking by `views`
+        // (present on both collections) makes it meaningful — but WITHOUT the
+        // recency window it surfaced old high-view legacy videos and dropped all
+        // recent content, so trending looked disconnected from new. Windowing
+        // both collections keeps trending = "recently popular".
+        const CANDIDATE_LIMIT = 200;
+        const TRENDING_WINDOW_DAYS = 30;
+        const windowStart = new Date(Date.now() - TRENDING_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+        const [legacyVideos, embedVideosRaw] = await Promise.all([
+            videosCollection.find({
+                status: 'published',
+                owner: { $nin: HIDDEN_AUTHORS },
+                publishFailed: { $ne: true },
+                community: communityId,
+                created: { $gte: windowStart },
+                ...nsfwFilterTags(req),
+            }).sort({ views: -1 }).limit(CANDIDATE_LIMIT).toArray(),
+            embedVideoCollection.find({
+                status: 'published',
+                short: false,
+                listed_on_3speak: true,
+                hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
+                hive_permlink: { $ne: null },
+                hive_tags: communityId,
+                createdAt: { $gte: windowStart },
+                ...nsfwFilterHiveTags(req),
+            }).sort({ views: -1 }).limit(CANDIDATE_LIMIT).toArray(),
+        ]);
+
+        const embedVideos = embedVideosRaw.map(transformEmbedVideoToLegacy);
+        const legacyWithMeta = legacyVideos.map(v => ({
+            ...v,
+            views: v.views || 0,
+            _views: v.views || 0,
+            _sortDate: new Date(v.created || v.created_at || 0).getTime(),
+        }));
+        const embedWithMeta = embedVideos.map(v => ({
+            ...v,
+            _views: v.views || 0,
+            _sortDate: new Date(v.created || v.created_at || 0).getTime(),
+        }));
+
+        const legacyKeys = new Set(legacyWithMeta.map(v => `${v.author || v.owner}/${v.permlink}`));
+        const uniqueEmbed = embedWithMeta.filter(ev => !legacyKeys.has(`${ev.author}/${ev.permlink}`));
+
+        // Rank by views desc, tie-break by recency.
+        const allVideos = [...legacyWithMeta, ...uniqueEmbed].sort(
+            (a, b) => (b._views - a._views) || (b._sortDate - a._sortDate)
+        );
+        const total = allVideos.length;
+        const totalPages = Math.ceil(total / limit);
+        const videos = allVideos.slice(skip, skip + limit);
+        videos.forEach(v => { delete v._views; delete v._sortDate; delete v._source; });
+
+        res.json({
+            success: true,
+            feed: 'community-trending',
+            community: communityId,
+            page, limit, total, totalPages,
+            videos,
+        });
+    } catch (error) {
+        console.error('Error fetching community trending feed:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 module.exports = router;

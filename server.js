@@ -13,6 +13,7 @@ const { syncAudioHiveLinks } = require('./services/audioHiveSync');
 const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
 const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
 const { schedule: scheduleAudioPayouts } = require('./services/audioPayouts');
+const { schedule: scheduleScheduledPosts } = require('./services/scheduledPosts');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -24,6 +25,7 @@ const audioRoutes = require('./routes/audio');
 const feedsRoutes = require('./routes/feeds');
 const rssRoutes = require('./routes/rss');
 const verifyRoutes = require('./routes/verify');
+const scheduledPostsRoutes = require('./routes/scheduledPosts');
 
 const app = express();
 
@@ -45,6 +47,7 @@ app.use('/audio', audioRoutes);
 app.use('/feeds', feedsRoutes);
 app.use('/rss', rssRoutes);
 app.use('/verify', verifyRoutes);
+app.use('/scheduled-posts', scheduledPostsRoutes);
 
 // Track whether heavy sync tasks are running
 let syncRunning = false;
@@ -143,6 +146,7 @@ async function startServer() {
     // Pay-per-listen weekly payout (period ends Sun 00:00 UTC, checked every
     // 12h with catch-up). Runs in DRY RUN until PPL_PAYOUT_ACTIVE_KEY is set.
     scheduleAudioPayouts();
+    scheduleScheduledPosts();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
