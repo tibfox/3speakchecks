@@ -70,6 +70,38 @@ const playlistJoin = [
     { $project: { _playlist: 0 } }
 ];
 
+// Pipeline stages that overwrite each audio doc's `plays` with the *derived*
+// listen count = (number of audio-listen-log rows for the track) + the
+// consolidated `archivedListens` (older rows folded into embed-audio by the
+// consolidation worker). This is the single source of truth for listen counts;
+// the stored `plays` field is no longer trusted (it held legacy count-on-load
+// values and was reset to 0). Apply BEFORE a `$sort: { plays }` to sort by it,
+// or after `$limit` to derive only the returned page.
+const listenCountStages = [
+    {
+        $lookup: {
+            from: 'audio-listen-log',
+            let: { perm: '$permlink' },
+            pipeline: [
+                { $match: { $expr: { $eq: ['$permlink', '$$perm'] } } },
+                { $count: 'c' },
+            ],
+            as: '_llc',
+        },
+    },
+    {
+        $addFields: {
+            plays: {
+                $add: [
+                    { $ifNull: [{ $arrayElemAt: ['$_llc.c', 0] }, 0] },
+                    { $ifNull: ['$archivedListens', 0] },
+                ],
+            },
+        },
+    },
+    { $project: { _llc: 0 } },
+];
+
 // Build a Mongo permlink filter from one or more auto-tag names (OR semantics).
 // Returns null if no valid tags. Always queries the subtitles-tags collection.
 async function autoTagPermlinkFilter(db, raw) {
@@ -326,6 +358,7 @@ router.post('/play-beat', async (req, res) => {
                         listenedSeconds: Math.round(accumulatedMs / 1000),
                         trackDuration: Math.round(s.durationMs / 1000),
                         payable: true, // payout-eligible; snapieaudio writes payable:false for anon plays
+                        ppl: true,     // checker only logs listens on ppl tracks
                         createdAt: new Date(now),
                         listenDate: new Date(now).toISOString().slice(0, 10), // UTC YYYY-MM-DD
                     });
@@ -431,22 +464,18 @@ router.get('/', async (req, res) => {
             ];
         }
 
-        // Sort: plays (popular), createdAt (newest), duration
+        // Sort: popular = derived listen count, else newest/duration.
+        const popularSort = req.query.sort === 'popular';
         let sort = { createdAt: -1 };
-        if (req.query.sort === 'popular') sort = { plays: -1, createdAt: -1 };
+        if (popularSort) sort = { plays: -1, createdAt: -1 };
         if (req.query.sort === 'longest') sort = { duration: -1 };
         if (req.query.sort === 'shortest') sort = { duration: 1 };
 
         const total = await audioCollection.countDocuments(audioQuery);
         const totalPages = Math.ceil(total / limit);
 
-        // Always use aggregate to join subtitle languages from subtitles collection
-        const pipeline = [
-            { $match: audioQuery },
-            { $sort: sort },
-            { $skip: skip },
-            { $limit: limit },
-            // Join subtitles — extract available language keys
+        // Subtitle-language join (extract available language keys).
+        const subtitleStages = [
             {
                 $lookup: {
                     from: 'subtitles',
@@ -475,8 +504,18 @@ router.get('/', async (req, res) => {
                 }
             },
             { $project: { _subs: 0 } },
-            ...playlistJoin
         ];
+
+        // Derive `plays` from the listen log. When sorting by popularity the
+        // derived count must exist before the $sort; otherwise derive it after
+        // paging so only the returned page pays for the lookup.
+        const pipeline = [{ $match: audioQuery }];
+        if (popularSort) {
+            pipeline.push(...listenCountStages, { $sort: sort }, { $skip: skip }, { $limit: limit });
+        } else {
+            pipeline.push({ $sort: sort }, { $skip: skip }, { $limit: limit }, ...listenCountStages);
+        }
+        pipeline.push(...subtitleStages, ...playlistJoin);
 
         // Optionally join auto-generated tags from subtitles-tags
         if (req.query.include_auto_tags === 'true') {
@@ -584,6 +623,7 @@ router.get('/grouped', async (req, res) => {
                 { $match: { ...baseMatch, ...categoryMatchClause(cat) } },
                 { $sort: { createdAt: -1 } },
                 { $limit: perGroup },
+                ...listenCountStages,
                 ...subtitleJoin
             ]).toArray();
             if (items.length > 0) {
@@ -591,9 +631,12 @@ router.get('/grouped', async (req, res) => {
             }
         }));
 
-        // Also fetch "popular" (most played) across all categories
+        // Also fetch "popular" (most played) across all categories — derive the
+        // listen count first, then filter/sort by it.
         const popular = await audioCollection.aggregate([
-            { $match: { ...baseMatch, plays: { $gt: 0 } } },
+            { $match: baseMatch },
+            ...listenCountStages,
+            { $match: { plays: { $gt: 0 } } },
             { $sort: { plays: -1 } },
             { $limit: perGroup },
             ...subtitleJoin
@@ -607,6 +650,7 @@ router.get('/grouped', async (req, res) => {
             { $match: baseMatch },
             { $sort: { createdAt: -1 } },
             { $limit: perGroup },
+            ...listenCountStages,
             ...subtitleJoin
         ]).toArray();
         if (recent.length > 0) {
@@ -754,9 +798,11 @@ router.get('/creators', async (req, res) => {
             }
         }
 
-        // Get distinct audio creators with play counts (within the filtered set)
+        // Get distinct audio creators with play counts (within the filtered set).
+        // Derive each track's listen count first, then sum per owner.
         const creators = await audioCollection.aggregate([
             { $match: audioQuery },
+            ...listenCountStages,
             { $group: {
                 _id: '$owner',
                 tracks: { $sum: 1 },
