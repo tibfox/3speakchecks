@@ -10,6 +10,7 @@ const { syncHiveProfiles } = require('./services/profileSync');
 const { denormalizeCommunityTitles } = require('./services/communityDenorm');
 const { startTagSyncWatcher } = require('./services/tagSync');
 const { syncAudioHiveLinks } = require('./services/audioHiveSync');
+const { syncEmbedCategories } = require('./services/embedCategorySync');
 const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
 const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
 const { schedule: scheduleAudioPayouts } = require('./services/audioPayouts');
@@ -125,6 +126,17 @@ async function startServer() {
         }, 30 * 60 * 1000);
     }, 2 * 60 * 1000);
     console.log('Audio-Hive link sync scheduled every 30min (first run in 2min)');
+
+    // Resolve & persist the Hive community (category) on embed-video docs so
+    // /feeds/community/* can filter reliably (first run in 1min, then every 15min).
+    setTimeout(() => {
+        syncEmbedCategories().catch(err => console.error('Embed category sync error:', err));
+        setInterval(() => {
+            if (syncRunning) return;
+            syncEmbedCategories().catch(err => console.error('Embed category sync error:', err));
+        }, 15 * 60 * 1000);
+    }, 60 * 1000);
+    console.log('Embed category sync scheduled every 15min (first run in 1min)');
 
     // Sync VSC subscription status → embed-users.premium. Runs on a
     // tight 60s cadence so the 1-day pass expires within ±1min of its
