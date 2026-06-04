@@ -24,10 +24,21 @@ router.get('/suggest', async (req, res) => {
         const prefixRegex = { $regex: `^${escapedQ}`, $options: 'i' };
         const containsRegex = { $regex: escapedQ, $options: 'i' };
 
-        const [titles, usernames, tags, communities, playlists] = await Promise.all([
+        const [titles, embedTitles, usernames, tags, embedTags, communities, playlists] = await Promise.all([
             db.collection('videos').find(
                 { title: containsRegex, status: 'published', publishFailed: { $ne: true } },
                 { projection: { title: 1, author: 1, owner: 1, permlink: 1, _id: 0 } }
+            ).limit(5).toArray(),
+            // Embed videos that have already been broadcast to Hive should also surface
+            // in the type-ahead — the regular `videos` index lags the embed service.
+            db.collection('embed-video').find(
+                {
+                    hive_title: containsRegex,
+                    status: 'published',
+                    hive_author: { $type: 'string' },
+                    hive_permlink: { $type: 'string' },
+                },
+                { projection: { hive_title: 1, hive_author: 1, owner: 1, hive_permlink: 1, _id: 0 } }
             ).limit(5).toArray(),
             db.collection('hiveprofiles').find(
                 { $or: [{ username: prefixRegex }, { display_name: containsRegex }] },
@@ -54,6 +65,32 @@ router.get('/suggest', async (req, res) => {
                 }
                 return result;
             }),
+            // Same tag scan against freshly-uploaded embed videos (hive_tags).
+            db.collection('embed-video').find(
+                {
+                    hive_tags: containsRegex,
+                    status: 'published',
+                    hive_author: { $type: 'string' },
+                },
+                { projection: { hive_tags: 1, _id: 0 } }
+            ).limit(50).toArray().then(docs => {
+                const re = new RegExp(escapedQ, 'i');
+                const seen = new Set();
+                const result = [];
+                for (const d of docs) {
+                    if (!Array.isArray(d.hive_tags)) continue;
+                    for (const raw of d.hive_tags) {
+                        if (typeof raw !== 'string') continue;
+                        const t = raw.trim().replace(/^#/, '');
+                        if (t && re.test(t) && !seen.has(t.toLowerCase())) {
+                            seen.add(t.toLowerCase());
+                            result.push(t);
+                            if (result.length >= 5) return result;
+                        }
+                    }
+                }
+                return result;
+            }),
             db.collection('hivecommunities').find(
                 { $or: [{ name: prefixRegex }, { title: containsRegex }] },
                 { projection: { name: 1, title: 1, about: 1, subscribers: 1, num_authors: 1, _id: 0 } }
@@ -65,10 +102,39 @@ router.get('/suggest', async (req, res) => {
             ]).toArray()
         ]);
 
+        // Merge title matches from videos + embed-video, deduped by author/permlink
+        // so the same Hive post doesn't appear twice when the indexer has caught up.
+        const titleSeen = new Set();
+        const allTitles = [];
+        for (const d of titles) {
+            const k = `${d.author || d.owner || ''}/${d.permlink || ''}`;
+            if (titleSeen.has(k)) continue;
+            titleSeen.add(k);
+            allTitles.push({ type: 'title', text: d.title, author: d.author || d.owner || '', permlink: d.permlink || '' });
+            if (allTitles.length >= 5) break;
+        }
+        for (const d of embedTitles) {
+            if (allTitles.length >= 5) break;
+            const k = `${d.hive_author || ''}/${d.hive_permlink || ''}`;
+            if (titleSeen.has(k)) continue;
+            titleSeen.add(k);
+            allTitles.push({ type: 'title', text: d.hive_title, author: d.hive_author || '', permlink: d.hive_permlink || '' });
+        }
+
+        // Merge tag matches from videos + embed-video, dedup case-insensitively, cap 5.
+        const tagSeen = new Set(tags.map(t => t.toLowerCase()));
+        const mergedTags = [...tags];
+        for (const t of embedTags) {
+            if (mergedTags.length >= 5) break;
+            if (tagSeen.has(t.toLowerCase())) continue;
+            tagSeen.add(t.toLowerCase());
+            mergedTags.push(t);
+        }
+
         const suggestions = [
-            ...titles.map(d => ({ type: 'title', text: d.title, author: d.author || d.owner || '', permlink: d.permlink || '' })),
+            ...allTitles,
             ...usernames.map(d => ({ type: 'user', username: d.username, display_name: d.display_name || '', profile_image: d.profile_image || '' })),
-            ...tags.map(t => ({ type: 'tag', text: t })),
+            ...mergedTags.map(t => ({ type: 'tag', text: t })),
             ...communities.map(d => ({ type: 'community', name: d.name, title: d.title || '', about: d.about || '', subscribers: d.subscribers || 0, num_authors: d.num_authors || 0 })),
             ...playlists.map(d => ({ type: 'playlist', id: d._id, name: d.name || '', owner: d.owner || '', video_count: d.video_count || 0 }))
         ];
