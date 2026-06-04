@@ -13,6 +13,7 @@ const { syncAudioHiveLinks } = require('./services/audioHiveSync');
 const { syncPremiumFromSubs } = require('./services/premiumSubsSync');
 const { schedule: scheduleCollectSubs } = require('./services/collectSubscriptions');
 const { schedule: scheduleAudioPayouts } = require('./services/audioPayouts');
+const { schedule: scheduleListenConsolidation } = require('./services/listenConsolidation');
 
 // Routes
 const healthRoutes = require('./routes/health');
@@ -143,6 +144,11 @@ async function startServer() {
     // Pay-per-listen weekly payout (period ends Sun 00:00 UTC, checked every
     // 12h with catch-up). Runs in DRY RUN until PPL_PAYOUT_ACTIVE_KEY is set.
     scheduleAudioPayouts();
+
+    // Consolidate audio-listen-log rows older than 5 months: fold their counts
+    // into embed-audio (archivedListens) then delete them. Keeps unpaid payable
+    // rows. Set LISTEN_CONSOLIDATE_DRY_RUN=true to preview without deleting.
+    scheduleListenConsolidation();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
