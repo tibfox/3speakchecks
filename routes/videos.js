@@ -332,31 +332,88 @@ router.get('/feed/:username', async (req, res) => {
         const followingList = await getFollowingList(username);
 
         const videosCollection = db.collection('videos');
-        let query = {};
-        let feedType = 'personalized';
+        const embedVideoCollection = db.collection('embed-video');
 
-        // If following list exists and has users, filter by them
+        // Build queries for both collections. Only TOP-LEVEL content: legacy
+        // `videos` are top-level by nature; embed videos are filtered with
+        // `short: false` so shorts are excluded.
+        let legacyQuery, embedQuery, feedType;
         if (followingList && followingList.length > 0) {
-            query = { owner: { $in: followingList }, status: 'published', ...nsfwFilterTags(req) };
+            legacyQuery = { owner: { $in: followingList }, status: 'published', ...nsfwFilterTags(req) };
+            embedQuery = {
+                hive_author: { $in: followingList },
+                status: 'published',
+                short: false,
+                listed_on_3speak: true,
+                hive_permlink: { $ne: null },
+                ...nsfwFilterHiveTags(req)
+            };
+            feedType = 'personalized';
             console.log(`Fetching feed for ${username}: ${followingList.length} following`);
         } else {
-            // Fallback: return all published videos
-            query = { status: 'published', ...nsfwFilterTags(req) };
-            console.log(`Feed fallback for ${username}: showing all videos (no following list)`);
+            // Fallback: all published top-level content (no following list)
+            legacyQuery = { status: 'published', ...nsfwFilterTags(req) };
+            embedQuery = {
+                status: 'published',
+                short: false,
+                listed_on_3speak: true,
+                hive_author: { $ne: null },
+                hive_permlink: { $ne: null },
+                ...nsfwFilterHiveTags(req)
+            };
             feedType = 'all';
+            console.log(`Feed fallback for ${username}: showing all videos (no following list)`);
         }
 
-        // Get total count for pagination
-        const total = await videosCollection.countDocuments(query);
-        const totalPages = Math.ceil(total / limit);
+        // Fetch legacy + embed videos in parallel (over-fetch, merge, paginate).
+        const [legacyVideos, embedVideosRaw] = await Promise.all([
+            videosCollection.find(legacyQuery).sort({ created: -1 }).limit(limit + skip).toArray(),
+            embedVideoCollection.find(embedQuery).sort({ createdAt: -1 }).limit(limit + skip).toArray()
+        ]);
 
-        // Fetch videos with pagination, sorted by created descending (newest first)
-        const videos = await videosCollection
-            .find(query)
-            .sort({ created: -1 })
-            .skip(skip)
-            .limit(limit)
-            .toArray();
+        // Transform embed videos to the legacy shape (same mapping the other feeds use).
+        const embedVideos = embedVideosRaw.map(ev => ({
+            owner: ev.owner,
+            author: ev.hive_author,
+            permlink: ev.hive_permlink,
+            title: ev.hive_title || ev.originalFilename || '',
+            body: ev.hive_body || '',
+            status: 'published',
+            created: ev.createdAt,
+            created_at: ev.createdAt,
+            duration: ev.duration || 0,
+            tags: ev.hive_tags || [],
+            tags_v2: (ev.hive_tags || []).map(t => t.toLowerCase()),
+            images: {
+                thumbnail: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/thumbnail.png`,
+                poster: ev.thumbnail_url || `https://img.3speak.tv/${ev.permlink}/poster.jpg`
+            },
+            spkvideo: {
+                duration: ev.duration || 0,
+                video_v2: ev.permlink,
+                play_url: ev.manifest_cid ? `https://ipfs.3speak.tv/ipfs/${ev.manifest_cid}` : null
+            },
+            _source: 'embed',
+            _sortDate: new Date(ev.createdAt || 0).getTime()
+        }));
+
+        const legacyWithDate = legacyVideos.map(v => ({
+            ...v,
+            _sortDate: new Date(v.created || v.created_at || 0).getTime()
+        }));
+
+        // Dedup embeds that already exist as legacy docs.
+        const legacyKeys = new Set(legacyWithDate.map(v => `${v.author || v.owner}/${v.permlink}`));
+        const uniqueEmbed = embedVideos.filter(ev => !legacyKeys.has(`${ev.author}/${ev.permlink}`));
+
+        // Merge and sort by date descending, then paginate.
+        const allVideos = [...legacyWithDate, ...uniqueEmbed];
+        allVideos.sort((a, b) => b._sortDate - a._sortDate);
+
+        const total = allVideos.length;
+        const totalPages = Math.ceil(total / limit);
+        const videos = allVideos.slice(skip, skip + limit);
+        videos.forEach(v => { delete v._sortDate; delete v._source; });
 
         // Return response
         res.json({
