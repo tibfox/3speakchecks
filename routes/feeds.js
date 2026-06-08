@@ -592,6 +592,15 @@ function validateCommunityId(id) {
     return /^hive-\d+$/.test(String(id || '').trim());
 }
 
+// An embed video belongs to a community when the Hive post's `category`
+// (parent_permlink) is that community — persisted by embedCategorySync. Some
+// posting clients also drop the community id into json_metadata tags, so we match
+// either source. This goes in a `$or` (its own key) so it never collides with the
+// `hive_tags: { $nin: [...] }` that nsfwFilterHiveTags() spreads in for nsfw exclusion.
+function communityMatchClause(communityId) {
+    return { $or: [{ category: communityId }, { hive_tags: communityId }] };
+}
+
 router.get('/community/:id/new', async (req, res) => {
     try {
         const communityId = String(req.params.id || '').trim();
@@ -621,8 +630,8 @@ router.get('/community/:id/new', async (req, res) => {
                 listed_on_3speak: true,
                 hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
                 hive_permlink: { $ne: null },
-                hive_tags: communityId,
                 ...nsfwFilterHiveTags(req),
+                ...communityMatchClause(communityId),
             }).sort({ createdAt: -1 }).limit(limit + skip).toArray(),
         ]);
 
@@ -697,9 +706,9 @@ router.get('/community/:id/trending', async (req, res) => {
                 listed_on_3speak: true,
                 hive_author: { $nin: [null, ...HIDDEN_AUTHORS] },
                 hive_permlink: { $ne: null },
-                hive_tags: communityId,
                 createdAt: { $gte: windowStart },
                 ...nsfwFilterHiveTags(req),
+                ...communityMatchClause(communityId),
             }).sort({ views: -1 }).limit(CANDIDATE_LIMIT).toArray(),
         ]);
 
