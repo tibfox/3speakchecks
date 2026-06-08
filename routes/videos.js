@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../utils/db');
 const { nsfwFilter, nsfwFilterTags, nsfwFilterHiveTags, BANNED_FILTER } = require('../utils/filters');
-const { getFollowingList } = require('../utils/hive');
+const { getFollowingList, hiveRpcBatch } = require('../utils/hive');
 const { getCachedViews, setCachedViews } = require('../utils/cache');
 const { validateApiKey } = require('../utils/middleware');
 const { ENABLE_MONGO_WRITES } = require('../utils/config');
@@ -435,33 +435,76 @@ router.get('/feed/:username', async (req, res) => {
     }
 });
 
-// Endpoint to get video details (reusable flag) from MongoDB
-// Supports both 3speak permlink and Hive permlink (via embed_url fallback)
+// Resolve the "reusable" flag for an embed video from the Hive post's
+// json_metadata — embed-video docs don't store it. Cached 30min so this stays a
+// fast lookup and we don't fire a Hive RPC on every video view.
+const _reusableCache = new Map();
+const REUSABLE_TTL = 30 * 60 * 1000;
+async function resolveEmbedReusable(hiveAuthor, hivePermlink) {
+    const key = `${hiveAuthor}/${hivePermlink}`;
+    const hit = _reusableCache.get(key);
+    if (hit && Date.now() - hit.ts < REUSABLE_TTL) return hit.value;
+    let reusable = false;
+    try {
+        const [r] = await hiveRpcBatch([{ jsonrpc: '2.0', id: 1, method: 'condenser_api.get_content', params: [hiveAuthor, hivePermlink] }]);
+        const post = r && r.result;
+        if (post && post.json_metadata) {
+            const md = JSON.parse(post.json_metadata);
+            reusable = !!((md && md.video && md.video.reusable) || (md && md.reusable));
+        }
+    } catch { /* default false */ }
+    _reusableCache.set(key, { value: reusable, ts: Date.now() });
+    return reusable;
+}
+
+// Endpoint to get video details (reusable flag) from MongoDB.
+// Resolves legacy `videos` AND `embed-video`, by 3speak/asset permlink or Hive
+// permlink (via embed_url). For embed videos `reusable` lives in the Hive post.
 router.get('/api/video/:owner/:permlink', async (req, res) => {
     const db = getDb();
     try {
         const { owner, permlink } = req.params;
         const videosCollection = db.collection('videos');
 
-        // Try direct match (3speak permlink) first
+        // Legacy `videos`: direct (3speak permlink) then embed_url (Hive permlink)
         let video = await videosCollection.findOne(
             { owner, permlink },
             { projection: { reusable: 1, _id: 0 } }
         );
-
-        // Fallback: try matching by embed_url (Hive permlink)
         if (!video) {
             video = await videosCollection.findOne(
                 { owner, embed_url: { $regex: `@${owner}/${permlink}$` } },
                 { projection: { reusable: 1, _id: 0 } }
             );
         }
+        if (video) {
+            return res.json({ success: true, reusable: video.reusable || false });
+        }
 
-        if (!video) {
+        // embed-video: match by asset permlink, then by embed_url (Hive permlink).
+        const embedCollection = db.collection('embed-video');
+        const embed = await embedCollection.findOne(
+            { owner, permlink },
+            { projection: { embed_url: 1, _id: 0 } }
+        ) || await embedCollection.findOne(
+            { owner, embed_url: { $regex: `@${owner}/${permlink}$` } },
+            { projection: { embed_url: 1, _id: 0 } }
+        );
+
+        if (!embed) {
             return res.status(404).json({ success: false, error: 'Video not found' });
         }
 
-        res.json({ success: true, reusable: video.reusable || false });
+        // Derive the Hive author/permlink from embed_url ("@author/permlink"); the
+        // request params may already be the Hive permlink, so fall back to those.
+        let hiveAuthor = owner;
+        let hivePermlink = permlink;
+        if (embed.embed_url) {
+            const parts = embed.embed_url.replace(/^@/, '').split('/');
+            if (parts.length === 2) { hiveAuthor = parts[0]; hivePermlink = parts[1]; }
+        }
+        const reusable = await resolveEmbedReusable(hiveAuthor, hivePermlink);
+        return res.json({ success: true, reusable });
     } catch (error) {
         console.error('Error fetching video details:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
