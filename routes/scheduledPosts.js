@@ -15,7 +15,8 @@ const router = express.Router();
 const { ObjectId } = require('mongodb');
 const { getDb } = require('../utils/db');
 const { verifyHiveSignedMessage } = require('../utils/hiveAuth');
-const { COLLECTION } = require('../services/scheduledPosts');
+const { validateApiKey } = require('../utils/middleware');
+const { COLLECTION, hasThreespeakPostingAuthority } = require('../services/scheduledPosts');
 const { SIGNATURE_TIMESTAMP_TOLERANCE_MS, HIVE_AUTH_REQUIRED } = require('../utils/config');
 
 const VALID_PAYOUT = new Set(['default', 'powerup', 'decline']);
@@ -47,7 +48,7 @@ function badTimestamp(ts) {
 }
 
 /* ─── POST /scheduled-posts/create ────────────────────────────────────── */
-router.post('/create', express.json({ limit: '2mb' }), async (req, res) => {
+router.post('/create', validateApiKey, express.json({ limit: '2mb' }), async (req, res) => {
     try {
         const {
             owner,
@@ -64,8 +65,6 @@ router.post('/create', express.json({ limit: '2mb' }), async (req, res) => {
             parentAuthor = '',
             parentPermlink = 'hive-181335',
             embedPermlink = null,   // embedvideos service's internal permlink; lets the cron link the video record to the broadcast Hive post afterwards
-            timestamp,
-            signature,
         } = req.body || {};
 
         // ─── basic validation ──────────────────────────────────────────
@@ -86,23 +85,24 @@ router.post('/create', express.json({ limit: '2mb' }), async (req, res) => {
         if (!VALID_PAYOUT.has(String(payoutOptions).toLowerCase())) {
             return res.status(422).json({ error: 'payoutOptions must be default | powerup | decline' });
         }
-        const tsErr = badTimestamp(timestamp);
-        if (tsErr) return res.status(401).json({ error: `Timestamp ${tsErr}` });
-        if (!signature) return res.status(401).json({ error: 'signature required' });
 
-        // ─── verify Hive signature ─────────────────────────────────────
-        const message = buildCreateMessage({ owner, permlink, scheduledOn, timestamp });
-        let ok;
+        // ─── authorize: app key (validateApiKey) + on-chain @threespeak grant ──
+        // We use the app-key trust model (same as PUT /video/thumbnail and the
+        // /api/broadcast app-key path) instead of a client Hive signature, because
+        // HiveSigner / ManteAuth can't sign arbitrary messages client-side. Safety
+        // comes from requiring that `owner` has granted @threespeak posting
+        // authority on-chain — without that grant the cron couldn't broadcast for
+        // them anyway, so the worst case is "act as a user who opted into @threespeak".
+        let granted;
         try {
-            ok = await verifySignedPayload({ message, signature, owner });
+            granted = await hasThreespeakPostingAuthority(owner);
         } catch (err) {
-            if (err && err.code === 'HIVE_ACCOUNT_NOT_FOUND') {
-                return res.status(404).json({ error: 'Hive account not found' });
-            }
-            console.error('[scheduledPosts] signature verify error:', err.message || err);
-            return res.status(401).json({ error: 'Invalid signature' });
+            console.error('[scheduledPosts] posting-auth check error:', err.message || err);
+            return res.status(502).json({ error: 'Could not verify posting authority' });
         }
-        if (!ok) return res.status(401).json({ error: 'Invalid signature' });
+        if (!granted) {
+            return res.status(403).json({ error: 'owner has not granted @threespeak posting authority' });
+        }
 
         // ─── upsert (allow re-scheduling a not-yet-posted entry) ──────
         const db = await getDb();
@@ -207,29 +207,26 @@ router.get('/:username', async (req, res) => {
 // beneficiaries/payoutOptions/thumbnail/jsonMetadata/embedPermlink can all
 // change. Posts already in `processing`, `posted`, `cancelled`, or `failed`
 // states are immutable — the route returns 404 / 409 for those.
-router.post('/update', express.json({ limit: '2mb' }), async (req, res) => {
+router.post('/update', validateApiKey, express.json({ limit: '2mb' }), async (req, res) => {
     try {
-        const { owner, permlink, timestamp, signature, updates } = req.body || {};
+        const { owner, permlink, updates } = req.body || {};
 
         if (!owner || typeof owner !== 'string') return res.status(422).json({ error: 'owner required' });
         if (!permlink || typeof permlink !== 'string') return res.status(422).json({ error: 'permlink required' });
-        const tsErr = badTimestamp(timestamp);
-        if (tsErr) return res.status(401).json({ error: `Timestamp ${tsErr}` });
-        if (!signature) return res.status(401).json({ error: 'signature required' });
         if (!updates || typeof updates !== 'object') return res.status(422).json({ error: 'updates object required' });
 
-        // Verify the owner signed the update.
-        const message = buildUpdateMessage({ owner, permlink, timestamp });
-        let ok;
+        // Authorize via app key (validateApiKey) + on-chain @threespeak grant — same
+        // model as /create (see note there). No client Hive signature required.
+        let granted;
         try {
-            ok = await verifySignedPayload({ message, signature, owner });
+            granted = await hasThreespeakPostingAuthority(owner);
         } catch (err) {
-            if (err && err.code === 'HIVE_ACCOUNT_NOT_FOUND') {
-                return res.status(404).json({ error: 'Hive account not found' });
-            }
-            return res.status(401).json({ error: 'Invalid signature' });
+            console.error('[scheduledPosts] posting-auth check error:', err.message || err);
+            return res.status(502).json({ error: 'Could not verify posting authority' });
         }
-        if (!ok) return res.status(401).json({ error: 'Invalid signature' });
+        if (!granted) {
+            return res.status(403).json({ error: 'owner has not granted @threespeak posting authority' });
+        }
 
         // Whitelist of fields the user can edit — never lets the client touch
         // status / attempts / postedAt / broadcastTxId etc.
@@ -321,25 +318,23 @@ router.post('/update', express.json({ limit: '2mb' }), async (req, res) => {
 });
 
 /* ─── POST /scheduled-posts/cancel ────────────────────────────────────── */
-router.post('/cancel', express.json(), async (req, res) => {
+router.post('/cancel', validateApiKey, express.json(), async (req, res) => {
     try {
-        const { owner, permlink, timestamp, signature } = req.body || {};
+        const { owner, permlink } = req.body || {};
         if (!owner || !permlink) return res.status(422).json({ error: 'owner and permlink required' });
-        const tsErr = badTimestamp(timestamp);
-        if (tsErr) return res.status(401).json({ error: `Timestamp ${tsErr}` });
-        if (!signature) return res.status(401).json({ error: 'signature required' });
 
-        const message = buildCancelMessage({ owner, permlink, timestamp });
-        let ok;
+        // Authorize via app key (validateApiKey) + on-chain @threespeak grant — same
+        // model as /create. No client Hive signature required.
+        let granted;
         try {
-            ok = await verifySignedPayload({ message, signature, owner });
+            granted = await hasThreespeakPostingAuthority(owner);
         } catch (err) {
-            if (err && err.code === 'HIVE_ACCOUNT_NOT_FOUND') {
-                return res.status(404).json({ error: 'Hive account not found' });
-            }
-            return res.status(401).json({ error: 'Invalid signature' });
+            console.error('[scheduledPosts] posting-auth check error:', err.message || err);
+            return res.status(502).json({ error: 'Could not verify posting authority' });
         }
-        if (!ok) return res.status(401).json({ error: 'Invalid signature' });
+        if (!granted) {
+            return res.status(403).json({ error: 'owner has not granted @threespeak posting authority' });
+        }
 
         const db = await getDb();
         const result = await db.collection(COLLECTION).findOneAndUpdate(
