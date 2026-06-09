@@ -47,6 +47,21 @@ function getKey() {
 }
 
 /**
+ * On-chain authorization check: has `owner` granted @threespeak posting authority?
+ * This is what makes app-key auth on the create route safe — a scheduled post can
+ * only ever be queued for a user who opted into @threespeak, and the cron can only
+ * broadcast on their behalf because of this exact grant.
+ */
+async function hasThreespeakPostingAuthority(owner) {
+    const [account] = await getClient().database.getAccounts([owner]);
+    if (!account) return false;
+    const posting = account.posting || {};
+    const auths = posting.account_auths || [];
+    const grant = auths.find(([acc]) => acc === THREESPEAK_USERNAME);
+    return !!grant && grant[1] >= (posting.weight_threshold || 1);
+}
+
+/**
  * Build the comment + comment_options operations from a stored doc.
  * Returns an array of dhive Operation tuples ready for sendOperations.
  */
@@ -328,4 +343,4 @@ function schedule() {
     }, 30 * 1000);
 }
 
-module.exports = { schedule, runOnce, COLLECTION };
+module.exports = { schedule, runOnce, COLLECTION, hasThreespeakPostingAuthority };
