@@ -96,6 +96,19 @@ async function main() {
   ok('legacy videos still hydrate', legacyOut[0]?.title === 'Old');
   ok('legacy videos carry no gated flag (spread path, never gated)', legacyOut[0]?.gated === undefined);
 
+  console.log('\nShared embed mapper');
+
+  // transformEmbedVideoToLegacy feeds /new, /firstUploads, the community feeds
+  // and the profile shelf. Same field-by-field trap as hydrate().
+  const feeds = require('../routes/feeds');
+  const t = feeds.__testables?.transformEmbedVideoToLegacy;
+  if (!t) {
+    ok('transformEmbedVideoToLegacy is exported for testing', false, 'add it to module.exports.__testables');
+  } else {
+    ok('mapper marks a gated video', t(embedDoc({ gated: true })).gated === true);
+    ok('mapper marks an ungated video false, not undefined', t(embedDoc()).gated === false);
+  }
+
   console.log(`\n${failures === 0 ? 'PASS' : 'FAIL'}: ${checks - failures}/${checks} checks passed\n`);
   process.exit(failures === 0 ? 0 : 1);
 }
