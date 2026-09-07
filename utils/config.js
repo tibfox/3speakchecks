@@ -667,6 +667,14 @@ module.exports = {
     // than 302-ing to the CDN, so the cache is what keeps that affordable: a burned
     // segment is identical for every viewer of the same video and campaign.
     AD_BURN_CACHE_DIR: process.env.AD_BURN_CACHE_DIR || '/var/cache/3speak-ad-burn',
+
+    /* Re-encode a spot's audio to match the video it is spliced into.
+     *
+     * Chrome refuses an audio sample-rate change inside one MSE SourceBuffer, and the
+     * library is mixed — some videos are 44100, some 48000, every ad creative is
+     * 44100 — so without this a spot silently fails to render on Chrome whenever the
+     * two disagree. Off means the old behaviour: serve the creative untouched. */
+    AD_AUDIO_NORMALISE: process.env.AD_AUDIO_NORMALISE !== 'false',
     AD_BURN_CACHE_MAX_MB: parseInt(process.env.AD_BURN_CACHE_MAX_MB) || 2048,
     AD_BURN_TIMEOUT_MS: parseInt(process.env.AD_BURN_TIMEOUT_MS) || 30000,
     // Banner geometry, as a percentage of the frame it is composited into — the same

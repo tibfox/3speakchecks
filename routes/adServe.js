@@ -46,6 +46,7 @@ const {
   STATES, CREATIVE_STATES, CREATIVE_KINDS, servableReason, ensureAdIndexes, slotSecondsFor,
   creativesByCampaign,
 } = require('../utils/adModel');
+const { knownRate, warmRate, normalisedSegment } = require('../services/adAudio');
 const { formatOf } = require('../utils/adFormats');
 const { burnSegment } = require('../services/adBurner');
 
@@ -409,7 +410,7 @@ async function loadAdSegments(adManifestUrl) {
  *   statement of how long the video is, and it is the same playlist the break is
  *   about to be cut into. A stored duration can disagree with the media.
  */
-function splice(contentText, contentBaseUrl, adSegments, slot, sid, publicBase) {
+function splice(contentText, contentBaseUrl, adSegments, slot, sid, publicBase, normalise) {
   const lines = contentText.split(/\r?\n/);
   const abs = (u) => { try { return new URL(u, contentBaseUrl).href; } catch { return u; } };
 
@@ -426,9 +427,14 @@ function splice(contentText, contentBaseUrl, adSegments, slot, sid, publicBase) 
     const first = i === 0;
     const last = i === adSegments.length - 1;
     // Single-segment spots would otherwise only ever report a start.
+    /* Middle segments normally point straight at the CDN — only the first and last
+     * come through us, because those are what the impression is counted from. When the
+     * audio has to be re-encoded that is not enough: a spot whose middle is the
+     * creative's own bytes still changes sample rate part way through, which is the
+     * very thing Chrome refuses. So normalising routes all of them. */
     adBlock.push(first || last
       ? `${publicBase}/m/${sid}/${first ? 'a' : 'b'}${first && last ? 'b' : ''}`
-      : seg.url);
+      : (normalise ? `${publicBase}/m/${sid}/am${i}` : seg.url));
   });
   adBlock.push('#EXT-X-DISCONTINUITY');
 
@@ -1372,7 +1378,25 @@ router.get('/:sid.m3u8', servingVisible, async (req, res) => {
     // A banner-only playback has no roll to splice: the playlist is already correct.
     if (session.adManifestUrl) {
       const adSegments = await loadAdSegments(session.adManifestUrl);
-      const spliced = splice(text, content.url, adSegments, session, sid, publicBase);
+
+      /* 🚨 DOES THIS SPOT'S AUDIO MATCH THE VIDEO IT IS GOING INTO?
+       *
+       * Both answers come from the cache only. Probing costs a round trip to the CDN
+       * and this is the request the viewer is waiting on to start playing, so an
+       * unknown rate means serve exactly as before and warm the answer in the
+       * background — the next playback of that video gets it right. Being wrong here
+       * costs one Chrome viewer one spot; blocking here costs everybody the start of
+       * their video. */
+      const contentRate = knownRate(content.url);
+      const adRate = knownRate(session.adManifestUrl);
+      if (contentRate === undefined) warmRate(content.url);
+      if (adRate === undefined) warmRate(session.adManifestUrl);
+      const normalise = !!(contentRate && adRate && contentRate !== adRate);
+      // The segment route obeys this rather than deciding again: the playlist it was
+      // reached from is what says whether those bytes need re-encoding.
+      mark.adAudioRate = normalise ? contentRate : null;
+
+      const spliced = splice(text, content.url, adSegments, session, sid, publicBase, normalise);
       text = spliced.text;
       // Record where the cut actually fell so the player can ask for it. Written on
       // every variant fetch, which is harmless — they all splice at the same boundary.
@@ -2024,11 +2048,33 @@ router.post('/:sid/dismiss', servingVisible, express.json({ limit: '1kb' }), asy
   }
 });
 
+/**
+ * Hand over one segment of the spot.
+ *
+ * Normally a redirect to the CDN, which is the cheap path and the one that has always
+ * run. When the playlist recorded that this session's audio has to match the video's,
+ * the re-encoded copy is sent from disk instead — and if that copy cannot be produced,
+ * the redirect still happens. A spot that fails to render on one browser is a smaller
+ * failure than a segment that does not arrive at all.
+ */
+async function sendSegment(res, seg, session) {
+  const rate = Number(session.adAudioRate) || 0;
+  if (rate > 0) {
+    const file = await normalisedSegment(seg.url, rate).catch(() => null);
+    if (file) {
+      res.type('video/mp2t');
+      return res.sendFile(file);
+    }
+  }
+  return res.redirect(302, seg.url);
+}
+
 router.get('/:sid/:n', servingVisible, async (req, res) => {
   try {
     const sid = str(req.params.sid, 64);
-    const n = str(req.params.n, 4);
-    if (!/^[0-9a-f]{32}$/.test(sid) || !/^(a|b|ab)$/.test(n)) return res.status(400).send('bad request');
+    const n = str(req.params.n, 8);
+    // `am<i>` is a middle segment, which only appears when the audio is being fixed.
+    if (!/^[0-9a-f]{32}$/.test(sid) || !/^(a|b|ab|am\d{1,3})$/.test(n)) return res.status(400).send('bad request');
 
     const db = getDb();
     const session = await db.collection(SESSIONS).findOne({ sid });
@@ -2036,15 +2082,17 @@ router.get('/:sid/:n', servingVisible, async (req, res) => {
 
     if (!session.adManifestUrl) return res.status(404).send('no spot on this session');
     const segments = await loadAdSegments(session.adManifestUrl);
-    const seg = n === 'a' ? segments[0] : segments[segments.length - 1];
+    const mid = n.startsWith('am') ? parseInt(n.slice(2), 10) : null;
+    const seg = mid != null ? segments[mid] : (n === 'a' ? segments[0] : segments[segments.length - 1]);
+    if (!seg) return res.status(404).send('no such segment');
 
     // Pacing: the closing segment cannot be reached before the spot has had time to
     // play. Same deal as the banner — the bytes go out regardless, they just do not
     // count, so a script cannot bank a completed impression in one round trip.
-    const needs = (n === 'a') ? 0 : (Number(session.adDurationSeconds) || 0);
+    const needs = (n === 'a' || mid != null) ? 0 : (Number(session.adDurationSeconds) || 0);
     if (await pacingRefusal(db, session, sid, needs)) {
       res.set('Cache-Control', 'no-store');
-      return res.redirect(302, seg.url);
+      return sendSegment(res, seg, session);
     }
 
     // Record BEFORE redirecting: the bytes are about to be served either way, and
@@ -2075,7 +2123,7 @@ router.get('/:sid/:n', servingVisible, async (req, res) => {
     });
 
     res.set('Cache-Control', 'no-store');
-    return res.redirect(302, seg.url);
+    return sendSegment(res, seg, session);
   } catch (err) {
     console.error('[ad-serve] segment failed:', err && err.message);
     return res.status(502).send('unavailable');
