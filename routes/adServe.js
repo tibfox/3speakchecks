@@ -46,7 +46,7 @@ const {
   STATES, CREATIVE_STATES, CREATIVE_KINDS, servableReason, ensureAdIndexes, slotSecondsFor,
   creativesByCampaign,
 } = require('../utils/adModel');
-const { knownRate, warmRate, normalisedSegment } = require('../services/adAudio');
+const { knownShape, warmShape, differs, conformedSegment } = require('../services/adConform');
 const { formatOf } = require('../utils/adFormats');
 const { burnSegment } = require('../services/adBurner');
 
@@ -1387,16 +1387,17 @@ router.get('/:sid.m3u8', servingVisible, async (req, res) => {
        * background — the next playback of that video gets it right. Being wrong here
        * costs one Chrome viewer one spot; blocking here costs everybody the start of
        * their video. */
-      const contentRate = knownRate(content.url);
-      const adRate = knownRate(session.adManifestUrl);
-      if (contentRate === undefined) warmRate(content.url);
-      if (adRate === undefined) warmRate(session.adManifestUrl);
-      const normalise = !!(contentRate && adRate && contentRate !== adRate);
-      // The segment route obeys this rather than deciding again: the playlist it was
-      // reached from is what says whether those bytes need re-encoding.
-      mark.adAudioRate = normalise ? contentRate : null;
+      const contentShape = knownShape(content.url);
+      const adShape = knownShape(session.adManifestUrl);
+      if (contentShape === undefined) warmShape(content.url);
+      if (adShape === undefined) warmShape(session.adManifestUrl);
+      const conform = differs(contentShape, adShape);
+      /* The segment route obeys this rather than deciding again: the playlist it was
+       * reached from is what says whether those bytes need re-encoding, and the shape
+       * is recorded so the encode and the cache key cannot drift from the decision. */
+      mark.adConformTo = conform ? contentShape : null;
 
-      const spliced = splice(text, content.url, adSegments, session, sid, publicBase, normalise);
+      const spliced = splice(text, content.url, adSegments, session, sid, publicBase, conform);
       text = spliced.text;
       // Record where the cut actually fell so the player can ask for it. Written on
       // every variant fetch, which is harmless — they all splice at the same boundary.
@@ -2058,9 +2059,9 @@ router.post('/:sid/dismiss', servingVisible, express.json({ limit: '1kb' }), asy
  * failure than a segment that does not arrive at all.
  */
 async function sendSegment(res, seg, session) {
-  const rate = Number(session.adAudioRate) || 0;
-  if (rate > 0) {
-    const file = await normalisedSegment(seg.url, rate).catch(() => null);
+  const target = session.adConformTo || null;
+  if (target) {
+    const file = await conformedSegment(seg.url, target).catch(() => null);
     if (file) {
       res.type('video/mp2t');
       return res.sendFile(file);
