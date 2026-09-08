@@ -38,6 +38,7 @@ const audioRoutes = require('./routes/audio');
 const feedsRoutes = require('./routes/feeds');
 const rssRoutes = require('./routes/rss');
 const pushRoutes = require('./routes/push');
+const incubationRoutes = require('./routes/incubation');
 const pushNotify = require('./services/pushNotify');
 const pushHive = require('./services/pushHive');
 const webPush = require('./utils/webPush');
@@ -124,6 +125,7 @@ app.use('/advertise', adCampaignRoutes);  // booking + payment, same mount, same
 // match. See the header of routes/adServe.js.
 app.use('/m', adServeRoutes);
 app.use('/push', pushRoutes);             // same ordering rule as above
+app.use('/incubation', incubationRoutes); // same ordering rule as above
 app.use('/', streamStatsRoutes);
 
 // Track whether heavy sync tasks are running
