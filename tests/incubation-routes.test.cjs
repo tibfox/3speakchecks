@@ -1,6 +1,7 @@
 // Offline check of routes/incubation.js against a throwaway mongo.
 // Deliberately does NOT touch the live checker or its database.
-process.env.MONGODB_URI = 'mongodb://127.0.0.1:47019';
+// Point at any throwaway mongo with MONGO_TEST_URI; never a real one.
+process.env.MONGODB_URI = process.env.MONGO_TEST_URI || 'mongodb://127.0.0.1:47019';
 process.env.DATABASE_NAME = 'checker_incub_test';
 
 const express = require('express');
