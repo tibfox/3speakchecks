@@ -730,7 +730,16 @@ router.get('/promoted', async (req, res) => {
             promotedUntil: ev.promotedUntil,
         }));
 
-        res.json({ success: true, feed: 'promoted', limit, total: videos.length, videos });
+        // Dismissals (always) + already-watched (hidewatched=1) BEFORE the client sees
+        // them; filtering only in the browser flashed a watched promo on first paint.
+        // An embed's uploader can differ from its Hive author, so the watched check
+        // runs on both keys. No ?currentuser= → unchanged (filterForUser no-ops).
+        let visible = await filterForUser(db, req, videos);
+        if (visible.some((v) => v.author && v.author !== v.owner)) {
+            visible = await filterForUser(db, req, visible, (v) => `${v.author}:${v.permlink}`);
+        }
+
+        res.json({ success: true, feed: 'promoted', limit, total: visible.length, videos: visible });
     } catch (error) {
         console.error('Error fetching promoted feed:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
