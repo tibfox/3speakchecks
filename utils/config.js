@@ -714,6 +714,9 @@ module.exports = {
     // and is excluded from BOTH serving and the forecast, so we never sell what we
     // have promised not to use.
     AD_CREATOR_PREFS_COLLECTION: process.env.AD_CREATOR_PREFS_COLLECTION || 'ad_creator_prefs',
+    // Per-video exceptions for a creator who otherwise carries ads, mirrored from the
+    // post's own json_metadata. See utils/videoAdOptOut.js.
+    AD_VIDEO_OPTOUTS_COLLECTION: process.env.AD_VIDEO_OPTOUTS_COLLECTION || 'ad_video_optouts',
     AD_INVENTORY_ENABLED: parseBool(process.env.AD_INVENTORY_ENABLED, true),
     AD_INVENTORY_INTERVAL_H: parseInt(process.env.AD_INVENTORY_INTERVAL_H) || 6,
     AD_INVENTORY_WINDOW_DAYS: parseInt(process.env.AD_INVENTORY_WINDOW_DAYS) || 30,

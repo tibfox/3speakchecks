@@ -1026,7 +1026,7 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
 
 
     // Premium viewers and opted-out creators, decided in one place.
-    const decision = await adDecision({ viewer, owner });
+    const decision = await adDecision({ viewer, owner, permlink });
     if (!decision.ads) {
       // `premium` is echoed so the player can flag the watch session accordingly.
       // The inventory forecast excludes premium sessions, and it can only do that
