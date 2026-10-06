@@ -114,7 +114,7 @@ function claimedAdKeys(body) {
 }
 
 /**
- * One ad per address per video per day.
+ * One ad per network (/24, /48 for IPv6) per video per day.
  *
  * Without it an anonymous viewer's cap resets on every page load (capId is per
  * load by design), so reloading a video in a loop earns its creator one paid
@@ -123,7 +123,7 @@ function claimedAdKeys(body) {
  * and bills advertisers for a script. A person rewatching the same video the
  * same day simply gets it without an ad.
  *
- * The key is a sha256 of address + video, never the address itself. It lives in
+ * The key is a sha256 of network + video, never the address itself. It lives in
  * Mongo (REPEAT_COLLECTION, TTL on `exp`) with the Map in front as a cache. It
  * used to be the Map alone, on the theory that a restart "costs at most one
  * extra ad per pair" - but the checker restarts several times a day (31 times
@@ -182,9 +182,19 @@ async function repeatPlayed(sid) {
   }
   if (p && p.exp > Date.now()) await markRepeat(p.key);
 }
+/* Keyed on the NETWORK (/24 for IPv4, /48 for IPv6), not the exact address: mobile
+ * and CGNAT users hop between addresses inside their ISP's block (one creator's own
+ * logged-out views on 2026-10-03 came 2h apart from two addresses of one /24), and
+ * Hive is small enough that two real viewers of the same video in the same /24 on
+ * the same day is rare (owner's call, 2026-10-06). */
 function repeatKeyOf(ip, owner, permlink) {
   if (!ip) return null;
-  return crypto.createHash('sha256').update(`${ip}|${owner}/${permlink}`).digest('base64').slice(0, 22);
+  const addr = String(ip).replace(/^::ffff:/i, '');
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(addr);
+  const net = v4
+    ? `${v4[1]}.${v4[2]}.${v4[3]}.0/24`
+    : `${addr.toLowerCase().split('::')[0].split(':').filter(Boolean).slice(0, 3).join(':')}::/48`;
+  return crypto.createHash('sha256').update(`net:${net}|${owner}/${permlink}`).digest('base64').slice(0, 22);
 }
 async function seenRepeat(key) {
   if (!key) return false;
