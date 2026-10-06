@@ -19,7 +19,9 @@
 
 const express = require('express');
 const router = express.Router();
-const { getDb } = require('../utils/db');
+const { getDb, getLinksCollection } = require('../utils/db');
+const { verifyAndStore, unlinkIfRevoked } = require('../services/verifier');
+const { hashForHiveUsername } = require('../utils/hash');
 const { call, qs } = require('../utils/incubationHosted');
 
 /** Pass the service's answer through, or 502 if it did not answer. */
@@ -255,6 +257,99 @@ router.put('/internal/contact/:userId', internalOnly, async (req, res) => {
     }
 });
 
+/* ── Warm-up "link your channel" (optional task) ─────────────────────────────
+ * A warm-up user has no Hive account, so their channel links are kept under
+ * `warmup:<butrauth userId>` in the same social_links collection (the userId,
+ * not the handle: a handle can still change before graduation). The code they
+ * put in their bio is md5 of that id, exactly like a Hive name's. Only 3Speak's
+ * API reaches these, after proving the warm-up session; claim-assets moves the
+ * links to the new Hive account at graduation.
+ *
+ * Its own platform list (WARMUP_LINK_PLATFORMS, default youtube,tiktok,instagram),
+ * NOT the VERIFY_<NAME> switches: prod allows profile links for YouTube and
+ * SoundCloud only, while warm-up users may still link these (owner 2026-10-06). */
+const WARMUP_LINK_PLATFORMS = (process.env.WARMUP_LINK_PLATFORMS || 'youtube,tiktok,instagram')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const warmupId = (userId) => `warmup:${userId}`.toLowerCase();
+const shapeLink = (r) => ({
+    platform: r.platform, platform_username: r.platform_username, verified: !!r.verified,
+    verified_at: r.verified_at || null, last_error: r.last_error || null,
+});
+
+// GET /incubation/internal/social/:userId → { code, platforms, links }
+router.get('/internal/social/:userId', internalOnly, async (req, res) => {
+    try {
+        const userId = String(req.params.userId || '');
+        if (!USER_ID_RE.test(userId)) return res.status(400).json({ error: 'Invalid user id' });
+        const id = warmupId(userId);
+        const rows = await getLinksCollection().find({ hive_username: id }).toArray();
+        res.json({ code: hashForHiveUsername(id), platforms: WARMUP_LINK_PLATFORMS, links: rows.map(shapeLink) });
+    } catch (err) {
+        console.error('[incubation] internal social read:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// POST /incubation/internal/social/verify { userId, platform, platform_username }
+router.post('/internal/social/verify', internalOnly, async (req, res) => {
+    const userId = String(req.body?.userId || '');
+    const platform = String(req.body?.platform || '').toLowerCase();
+    const platformUsername = String(req.body?.platform_username || '').trim();
+    if (!USER_ID_RE.test(userId)) return res.status(400).json({ error: 'Invalid user id' });
+    if (!WARMUP_LINK_PLATFORMS.includes(platform)) {
+        return res.status(400).json({ error: `Unsupported platform: ${platform}`, supported: WARMUP_LINK_PLATFORMS });
+    }
+    if (!platformUsername) return res.status(400).json({ error: 'platform_username is required' });
+    try {
+        const saved = await verifyAndStore({ hive_username: warmupId(userId), platform, platform_username: platformUsername }, { ignoreLinkSwitch: true });
+        res.json(shapeLink(saved));
+    } catch (err) {
+        if (err.code === 'CHANNEL_NOT_FOUND') return res.status(404).json({ error: err.message });
+        if (err.code === 'CHANNEL_ALREADY_LINKED') return res.status(409).json({ error: 'This channel is already linked to another account', code: 'CHANNEL_ALREADY_LINKED' });
+        if (err.code === 'TOO_MANY_LINKS') return res.status(409).json({ error: err.message, code: 'TOO_MANY_LINKS' });
+        console.error('[incubation] internal social verify:', err.message);
+        res.status(502).json({ error: 'Platform lookup failed.' });
+    }
+});
+
+// POST /incubation/internal/social/unlink { userId, platform, platform_username }
+// Same rule as /verify/unlink: removed only once the code is gone from the bio.
+router.post('/internal/social/unlink', internalOnly, async (req, res) => {
+    const userId = String(req.body?.userId || '');
+    const platform = String(req.body?.platform || '').toLowerCase();
+    const platformUsername = String(req.body?.platform_username || '').trim();
+    if (!USER_ID_RE.test(userId) || !platform || !platformUsername) return res.status(400).json({ error: 'userId, platform and platform_username are required' });
+    try {
+        const result = await unlinkIfRevoked({ hive_username: warmupId(userId), platform, platform_username: platformUsername });
+        if (result.status === 'deleted') return res.json({ status: 'deleted' });
+        if (result.status === 'not_found') return res.status(404).json({ error: 'No such link' });
+        if (result.status === 'still_present') {
+            return res.status(409).json({ error: 'The code is still on your profile. Remove it from your bio, then try again.', status: 'still_present' });
+        }
+        res.status(502).json({ error: 'Platform lookup failed.' });
+    } catch (err) {
+        console.error('[incubation] internal social unlink:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// Move a graduate's warm-up links onto their new Hive account. A channel that
+// account already has is dropped from the warm-up copy (the unique index is
+// hive_username + platform + platform_username).
+async function moveWarmupLinks(userId, hiveUsername) {
+    if (!USER_ID_RE.test(userId)) return 0;
+    const coll = getLinksCollection();
+    const rows = await coll.find({ hive_username: warmupId(userId) }).toArray();
+    let moved = 0;
+    for (const r of rows) {
+        const clash = await coll.findOne({ hive_username: hiveUsername, platform: r.platform, platform_username: r.platform_username });
+        if (clash) { await coll.deleteOne({ _id: r._id }); continue; }
+        await coll.updateOne({ _id: r._id }, { $set: { hive_username: hiveUsername, moved_from_warmup: warmupId(userId), moved_at: new Date() } });
+        moved += 1;
+    }
+    return moved;
+}
+
 // POST /incubation/internal/claim-assets { handle, hiveUsername } — move the
 // uploads made under a warm-up handle onto the Hive account it graduated to.
 //
@@ -281,14 +376,19 @@ router.post('/internal/claim-assets', internalOnly, async (req, res) => {
             linkQuery,
             { $set: { hiveAccount: hiveUsername, graduatedAt: new Date() } },
         );
+        // Channel links made during the warm-up (also before the same-name return).
+        const linksMoved = await moveWarmupLinks(userId, hiveUsername).catch((e) => {
+            console.error('[incubation] claim-assets: moving warm-up links failed:', e.message);
+            return 0;
+        });
         // Same string: a no-op that would also sweep in anything uploaded after
         // graduation.
-        if (handle === hiveUsername) return res.json({ claimed: 0, reason: 'same_name' });
+        if (handle === hiveUsername) return res.json({ claimed: 0, reason: 'same_name', linksMoved });
         const result = await getDb().collection('embed-video').updateMany(
             { owner: handle },
             { $set: { owner: hiveUsername, owner_claimed_from: handle, owner_claimed_at: new Date() } },
         );
-        res.json({ claimed: result.modifiedCount, from: handle, to: hiveUsername });
+        res.json({ claimed: result.modifiedCount, from: handle, to: hiveUsername, linksMoved });
     } catch (err) {
         console.error('[incubation] internal claim-assets:', err.message);
         res.status(500).json({ error: 'Internal error' });

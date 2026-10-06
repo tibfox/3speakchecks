@@ -48,6 +48,10 @@ const { AD_SIGNING_DELEGATES } = require('../utils/config');
 const COLLECTION = 'announcements';
 const REPLIES = 'announcement_replies';
 const HIVE_RE = /^[a-z][a-z0-9.-]{2,15}$/;
+// A Hive account, or a ButrAuth warm-up handle written `~handle` (no Hive name yet;
+// `~` cannot occur in a Hive name, so the two can never be confused). Address a
+// warm-up user with username: "~handle".
+const isRecipientName = (n) => HIVE_RE.test(n) || (n.startsWith('~') && HIVE_RE.test(n.slice(1)));
 const MAX_REPLY = 2000;
 const VOUCH_MAX_AGE_MS = 10 * 60 * 1000;
 
@@ -87,7 +91,7 @@ function targetsOf(doc) {
 // The account a vouch proves, or null. Never throws: a bad proof is just no proof.
 async function provenAccount(b, message) {
   const name = str(b.username, 32).toLowerCase().replace(/^@/, '');
-  if (!HIVE_RE.test(name) || !b.signature || !b.timestamp) return { name, proven: null, signer: null };
+  if (!isRecipientName(name) || !b.signature || !b.timestamp) return { name, proven: null, signer: null };
   const ts = Number(b.timestamp);
   if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > VOUCH_MAX_AGE_MS) return { name, proven: null, signer: null };
   try {
@@ -242,7 +246,7 @@ router.post('/announcements/:number/replies', async (req, res) => {
       number,
       text,
       username,
-      claimed_username: username ? null : (HIVE_RE.test(name) ? name : null),
+      claimed_username: username ? null : (isRecipientName(name) ? name : null),
       signed_by: signedBy,
       app_version: str(b.app_version, 32) || null,
       processed: false,
