@@ -1,6 +1,6 @@
 const { getLinksCollection } = require('../utils/db');
 const { hashForHiveUsername } = require('../utils/hash');
-const { getPlatform } = require('./platforms');
+const { getPlatform, isLinkEnabled } = require('./platforms');
 const { MAX_LINKS_PER_USER } = require('../utils/config');
 
 function requireAdapter(platform) {
@@ -35,6 +35,12 @@ async function verifyAndStore({ hive_username, platform, platform_username }) {
     if (!platform_username) throw new Error('platform_username is required');
 
     const adapter = requireAdapter(platform);
+    // New links only for switched-on platforms (VERIFY_<NAME>); unlinking is not gated.
+    if (!isLinkEnabled(adapter.name)) {
+        const err = new Error(`Unsupported platform: ${platform}`);
+        err.code = 'UNSUPPORTED_PLATFORM';
+        throw err;
+    }
     const profile = await adapter.fetchProfile(platform_username);
     const hash = hashForHiveUsername(hive_username);
     const verified = typeof profile.text === 'string' && profile.text.includes(hash);
