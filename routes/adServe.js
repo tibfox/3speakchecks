@@ -123,47 +123,87 @@ function claimedAdKeys(body) {
  * and bills advertisers for a script. A person rewatching the same video the
  * same day simply gets it without an ad.
  *
- * Same deal as the rate limiter: the key is a hash in a Map with an expiry,
- * never a document or a log line. A restart forgets it, which costs at most one
- * extra ad per pair.
+ * The key is a sha256 of address + video, never the address itself. It lives in
+ * Mongo (REPEAT_COLLECTION, TTL on `exp`) with the Map in front as a cache. It
+ * used to be the Map alone, on the theory that a restart "costs at most one
+ * extra ad per pair" - but the checker restarts several times a day (31 times
+ * in the first week of October), and every restart handed every address a
+ * fresh first ad. The pending sid -> key link is persisted the same way, so an
+ * ad that starts before a restart and plays after it still marks its key.
  *
  * Marked only when an ad was actually PLAYED, not when one was handed out: a
  * session only parks its key under its sid (pendingRepeat), and recordDelivery
  * marks it the first time that session's impression is counted, which is the
  * same "delivered" that billing and payout use. Someone who leaves before the ad
  * plays has not used up the day's ad.
+ *
+ * Mongo trouble fails OPEN (the ad is served): the Map still holds everything
+ * marked since the last restart, and a Mongo blip must not switch ads off.
  */
 const REPEAT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PENDING_REPEAT_MS = 2 * 60 * 60 * 1000;
+const REPEAT_COLLECTION = 'ad_repeat_gate';
 const repeatSeen = new Map();
 const pendingRepeat = new Map();   // sid -> { key, exp }
+let repeatIndexed = false;
+function repeatColl() {
+  const c = getDb().collection(REPEAT_COLLECTION);
+  if (!repeatIndexed) {
+    repeatIndexed = true;
+    c.createIndex({ exp: 1 }, { expireAfterSeconds: 0 }).catch((err) => {
+      repeatIndexed = false;
+      console.error('[ad-serve] repeat gate index failed:', err && err.message);
+    });
+  }
+  return c;
+}
 function parkRepeat(sid, key) {
   if (!sid || !key) return;
   const now = Date.now();
   if (pendingRepeat.size > 50000) {
     for (const [s, p] of pendingRepeat) if (p.exp <= now) pendingRepeat.delete(s);
   }
-  pendingRepeat.set(sid, { key, exp: now + PENDING_REPEAT_MS });
+  const exp = now + PENDING_REPEAT_MS;
+  pendingRepeat.set(sid, { key, exp });
+  repeatColl().updateOne({ _id: `p:${sid}` }, { $set: { key, exp: new Date(exp) } }, { upsert: true })
+    .catch((err) => console.error('[ad-serve] repeat park failed:', err && err.message));
 }
 /** Called on a session's first counted delivery. */
-function repeatPlayed(sid) {
-  const p = pendingRepeat.get(sid);
-  if (!p) return;
+async function repeatPlayed(sid) {
+  if (!sid) return;
+  let p = pendingRepeat.get(sid);
   pendingRepeat.delete(sid);
-  if (p.exp > Date.now()) markRepeat(p.key);
+  try {
+    const doc = await repeatColl().findOneAndDelete({ _id: `p:${sid}` });
+    const d = doc && (doc.value !== undefined ? doc.value : doc);
+    if (!p && d && d.key) p = { key: d.key, exp: new Date(d.exp).getTime() };
+  } catch (err) {
+    console.error('[ad-serve] repeat pending lookup failed:', err && err.message);
+  }
+  if (p && p.exp > Date.now()) await markRepeat(p.key);
 }
 function repeatKeyOf(ip, owner, permlink) {
   if (!ip) return null;
   return crypto.createHash('sha256').update(`${ip}|${owner}/${permlink}`).digest('base64').slice(0, 22);
 }
-function seenRepeat(key) {
+async function seenRepeat(key) {
   if (!key) return false;
+  const now = Date.now();
   const exp = repeatSeen.get(key);
-  if (exp && exp > Date.now()) return true;
+  if (exp && exp > now) return true;
   if (exp) repeatSeen.delete(key);
+  try {
+    const doc = await repeatColl().findOne({ _id: `s:${key}` }, { projection: { exp: 1 } });
+    if (doc && doc.exp && doc.exp.getTime() > now) {
+      repeatSeen.set(key, doc.exp.getTime());
+      return true;
+    }
+  } catch (err) {
+    console.error('[ad-serve] repeat lookup failed:', err && err.message);
+  }
   return false;
 }
-function markRepeat(key) {
+async function markRepeat(key) {
   if (!key) return;
   const now = Date.now();
   // Opportunistic prune, as overRateLimit does.
@@ -171,6 +211,8 @@ function markRepeat(key) {
     for (const [k, exp] of repeatSeen) if (exp <= now) repeatSeen.delete(k);
   }
   repeatSeen.set(key, now + REPEAT_WINDOW_MS);
+  await repeatColl().updateOne({ _id: `s:${key}` }, { $set: { exp: new Date(now + REPEAT_WINDOW_MS) } }, { upsert: true })
+    .catch((err) => console.error('[ad-serve] repeat mark failed:', err && err.message));
 }
 
 /** The caller's address, for rate limiting only. Never stored, never returned. */
@@ -180,6 +222,71 @@ function callerIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return String(xff).split(',')[0].trim();
   return req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : '';
+}
+
+/**
+ * Is the caller the video's own creator, watching signed out?
+ *
+ * A signed-in owner never gets an ad on their own video, but signed out they were
+ * just another address: on 2026-10-06 20 of one creator's 55 impressions came from
+ * their own /24, minutes after each upload. The creator's addresses are already
+ * known as keyed hashes: `uploader_ip_hash/_net_hash` on their uploads (embedvideos)
+ * and `viewer_ip_hash/_net_hash` on their own reward rows (player). Hash the caller
+ * the same way and compare; a hit on either the connection or its /24 means no ad.
+ *
+ * 🚨 Byte-for-byte the same inputs as embedvideos src/utils/ipHash.ts and the
+ * player's viewerIpHashes (`ip:<addr>`, `net:<a.b.c.0/24>` or `<g1:g2:g3>::/48`),
+ * with the SAME IP_HASH_SECRET. No secret = the check is off (fails open). Hashes
+ * only: the address is never stored, logged or returned. ⚠️ Never log the key.
+ */
+const OWNER_HASH_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const OWNER_HASH_TTL_MS = 10 * 60 * 1000;
+const ownerHashCache = new Map();   // owner -> { set: Set<hash>, exp }
+function callerIpHashes(ip) {
+  const secret = process.env.IP_HASH_SECRET || '';
+  if (!secret || !ip) return null;
+  const addr = String(ip).replace(/^::ffff:/i, '');
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(addr);
+  const net = v4
+    ? `${v4[1]}.${v4[2]}.${v4[3]}.0/24`
+    : `${addr.toLowerCase().split('::')[0].split(':').filter(Boolean).slice(0, 3).join(':')}::/48`;
+  const h = (v) => crypto.createHmac('sha256', secret).update(v).digest('hex').slice(0, 32);
+  return [h(`ip:${addr}`), h(`net:${net}`)];
+}
+async function ownerHashes(owner) {
+  const now = Date.now();
+  const hit = ownerHashCache.get(owner);
+  if (hit && hit.exp > now) return hit.set;
+  const since = new Date(now - OWNER_HASH_WINDOW_MS);
+  const db = getDb();
+  const [ups, watches] = await Promise.all([
+    db.collection('embed-video')
+      .find({ owner, createdAt: { $gte: since }, uploader_ip_hash: { $type: 'string' } })
+      .project({ uploader_ip_hash: 1, uploader_net_hash: 1 }).limit(500).toArray(),
+    db.collection('ad_viewer_watch')
+      .find({ viewer: owner, at: { $gte: since }, viewer_ip_hash: { $type: 'string' } })
+      .project({ viewer_ip_hash: 1, viewer_net_hash: 1 }).limit(2000).toArray(),
+  ]);
+  const set = new Set();
+  for (const u of ups) { set.add(u.uploader_ip_hash); if (u.uploader_net_hash) set.add(u.uploader_net_hash); }
+  for (const w of watches) { set.add(w.viewer_ip_hash); if (w.viewer_net_hash) set.add(w.viewer_net_hash); }
+  if (ownerHashCache.size > 20000) {
+    for (const [k, v] of ownerHashCache) if (v.exp <= now) ownerHashCache.delete(k);
+  }
+  ownerHashCache.set(owner, { set, exp: now + OWNER_HASH_TTL_MS });
+  return set;
+}
+async function isOwnerConnection(ip, owner) {
+  if (!owner) return false;
+  const mine = callerIpHashes(ip);
+  if (!mine) return false;
+  try {
+    const set = await ownerHashes(owner);
+    return mine.some((h) => set.has(h));
+  } catch (err) {
+    console.error('[ad-serve] owner connection check failed:', err && err.message);
+    return false;
+  }
 }
 
 /**
@@ -871,7 +978,8 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
      * covers every one of the many return paths below without touching them. */
     if (surface !== 'upload') {
       const repeatKey = repeatKeyOf(callerIp(req), owner, permlink);
-      if (seenRepeat(repeatKey)) return res.json({ ad: null, reason: 'repeat_viewer' });
+      if (await seenRepeat(repeatKey)) return res.json({ ad: null, reason: 'repeat_viewer' });
+      if (await isOwnerConnection(callerIp(req), owner)) return res.json({ ad: null, reason: 'own_video' });
       const sendJson = res.json.bind(res);
       res.json = (body) => {
         const m = body ? /\/m\/([0-9a-f]{32})[./]/.exec(JSON.stringify(body)) : null;
@@ -1852,7 +1960,7 @@ async function recordDelivery({ db, sid, campaignId, facts, completed, maxFacts,
     if (first) {
       // The ad has now really played for this session: from here on this address
       // gets no further ad on this video today.
-      repeatPlayed(sid);
+      await repeatPlayed(sid);
       await db.collection(AD_CAMPAIGNS_COLLECTION).updateOne(
         { _id: campaignId },
         { $inc: { deliveredImpressions: 1 }, $set: { status: STATES.RUNNING, updatedAt: new Date() } },
