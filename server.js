@@ -63,6 +63,7 @@ const reviewsRoutes = require('./routes/reviews');
 const reportsRoutes = require('./routes/reports');
 const streamStatsRoutes = require('./routes/streamStats');
 const subtitleProxyRoutes = require('./routes/subtitleProxy');
+const subtitleEditRoutes = require('./routes/subtitleEdit');
 const advertiseRoutes = require('./routes/advertise');
 const adCampaignRoutes = require('./routes/adCampaigns');
 const adSelfPromoRoutes = require('./routes/adSelfPromo');
@@ -125,6 +126,7 @@ app.use('/', reportsRoutes);
 // request that reaches it — including ones meant for routes mounted after it.
 // Ordering this route first sidesteps that instead of touching streamStats.js.
 app.use('/', subtitleProxyRoutes);
+app.use('/', subtitleEditRoutes);          // author caption edits; same ordering rule (before streamStats)
 app.use('/advertise', advertiseRoutes);   // same reason as above: must precede streamStatsRoutes
 app.use('/advertise', adCampaignRoutes);  // booking + payment, same mount, same ordering rule
 app.use('/advertise', adSelfPromoRoutes); // a creator promoting their OWN video, same mount
