@@ -280,6 +280,14 @@ module.exports = {
     DISCOVER_RETENTION_MIN_MULT: parseFloat(process.env.DISCOVER_RETENTION_MIN_MULT ?? '0.4'),
     DISCOVER_RETENTION_MAX_MULT: parseFloat(process.env.DISCOVER_RETENTION_MAX_MULT ?? '2.5'),
     DISCOVER_JITTER: parseFloat(process.env.DISCOVER_JITTER ?? '0.15'),              // ±15% seeded per-video jitter
+    // Discover ORDER is a seeded weighted draw (weight = score^power), not a sort.
+    // Jitter alone could not move a 4.35 below a 3.5, so every reload showed the same
+    // ~26 videos on screen 1 (measured 2026-10-08: two reloads shared 7.7 of 12).
+    // Simulated on the live pool (share of screen 1 two reloads have in common /
+    // average quality vs the sort): 6 → 3.5 of 12 / 89%, 5 → ~3 / ~86%,
+    // 4 → 2.5 / 83%, 3 → 1.9 / 79%, 2 → 1.1 / 69%. Owner wanted more variety than 5
+    // (2026-10-08). Higher = closer to the old sort; 0 restores the plain sort.
+    DISCOVER_SAMPLE_POWER: parseFloat(process.env.DISCOVER_SAMPLE_POWER ?? '3'),
     DISCOVER_EXPLORE_EVERY: parseInt(process.env.DISCOVER_EXPLORE_EVERY) || 4,       // every Nth slot = exploration pick (25%) — legacy interleave only
 
     // ── Target AGE DISTRIBUTION of the discover page (the primary age control) ──
