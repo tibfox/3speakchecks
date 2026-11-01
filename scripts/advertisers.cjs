@@ -223,6 +223,8 @@ withDb(async (db) => {
         + `${pad(c.trimToSeconds ? `first ${c.trimToSeconds}s` : `${c.durationSeconds || 0}s`, 14)} ${flights} flight(s)`);
       // A ticker IS its text and link, so the reviewer reads them right here.
       if (c.kind === 'text') console.log(`    "${c.message}"\n    -> ${c.clickUrl}`);
+      // An audio spot: the levelled file to listen to, and its link.
+      if (c.kind === 'audio') console.log(`    listen: https://checker.3speak.tv/m/tts/${c.audioFile}\n    -> ${c.clickUrl}`);
     }
     console.log(`\n${rows.length} creative(s). approve-creative <embedId> | reject-creative <embedId> [--note "…"]`);
     return;
@@ -250,6 +252,10 @@ withDb(async (db) => {
       }
       if ((c.kind || 'video') === 'image' && !c.imageUrl) {
         console.error('That banner has no image on record — nothing to show.');
+        process.exitCode = 1; return;
+      }
+      if (c.kind === 'audio' && !c.audioFile) {
+        console.error('That audio spot has no file on record, nothing to play.');
         process.exitCode = 1; return;
       }
       if (c.advertiserRef) {

@@ -31,6 +31,7 @@ const lightningSupports = require('./services/lightningSupports');
 const podcastFeeds = require('./services/podcastFeeds');
 const adPayouts = require('./services/adPayouts');
 const adCreativeSync = require('./services/adCreativeSync');
+const adTts = require('./utils/adTts');
 const adSettings = require('./utils/adSettings');
 const { scheduleDiscover } = require('./services/discover');
 const { scheduleCommentCounts } = require('./services/commentCounts');
@@ -423,6 +424,18 @@ async function startServer() {
         console.log(`Ad payment watcher scheduled every ${adPaymentWatch.INTERVAL_MIN} min (first run in 1 min)`);
     } else {
         console.log('Ad payment watcher disabled');
+    }
+
+    // Spoken tickers: renders each ticker message to an MP3 for the audio player's
+    // spots (utils/adTts.js). Idle when Piper or its voice is not on this box.
+    if (adTts.enabled()) {
+        setTimeout(() => {
+            adTts.runOnce();
+            setInterval(() => adTts.runOnce(), adTts.INTERVAL_MIN * 60 * 1000);
+        }, 90 * 1000);
+        console.log(`Spoken ticker renderer scheduled every ${adTts.INTERVAL_MIN} min (first run in 90 s)`);
+    } else {
+        console.log('Spoken ticker renderer idle (no Piper / voice, or Mongo writes off)');
     }
 
     // Suspicious views / ad impressions scanner: read-only aggregations, posts new

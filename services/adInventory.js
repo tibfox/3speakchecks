@@ -179,6 +179,114 @@ function slotPipeline(percent, since, ownerFilter, duration) {
   ];
 }
 
+/* ─── the AUDIO and UPLOAD audiences, for their tabs on /advertise ──────────
+ *
+ * AUDIO reads `listen-durations` (3Speak audio only, kind 'audio': outside podcasts
+ * carry none of our spots), with the same engagement floor and the same reach test
+ * at each position as the video slots. Listening was first logged 2026-10-31, so the
+ * per-day figures divide by the days actually MEASURED, not the whole window, or a
+ * young log would read as a dead one. `trialListensPerDay` is the part a booking
+ * reaches today: audio spots play only on AD_AUDIO_TICKER_ALLOWED_OWNERS' audio.
+ *
+ * UPLOADS reads `embed-video`: uploads made on 3speak.tv (frontend_app '3speak-tv'),
+ * which is where the pre-upload spot plays, once per upload. Other apps' uploads
+ * never see it, so they are not counted. */
+const LISTEN_LOG = process.env.LISTEN_LOG_COLLECTION || 'listen-durations';
+const LISTENED = { $ifNull: ['$contentSeconds', { $ifNull: ['$listenedSeconds', 0] }] };
+const LISTEN_REACHED = { $ifNull: ['$maxPosition', { $ifNull: ['$lastPosition', LISTENED] }] };
+
+async function computeAudio(db, since, windowDays, excludedOwners) {
+  const { AUDIO_TICKER_ALLOWED_OWNERS } = require('../utils/adTts');
+  const match = {
+    kind: 'audio',
+    startedAt: { $gte: since },
+    owner: { $nin: excludedOwners },
+    $expr: { $gte: [LISTENED, AD_MIN_ENGAGED_SECONDS] },
+  };
+  const slotFacets = {};
+  for (const percent of AD_SLOT_PERCENTS) {
+    slotFacets[`p${percent}`] = [
+      ...(percent > 0 ? [{ $match: { $expr: { $gte: [LISTEN_REACHED,
+        { $multiply: [{ $ifNull: ['$duration', 0] }, percent / 100] }] } } }] : []),
+      { $count: 'n' },
+    ];
+  }
+  const [f] = await db.collection(LISTEN_LOG).aggregate([
+    { $match: match },
+    { $facet: {
+      total: [{ $group: {
+        _id: null, n: { $sum: 1 }, seconds: { $sum: LISTENED }, first: { $min: '$startedAt' },
+        tracks: { $addToSet: { $concat: [{ $toString: '$owner' }, '/', { $toString: '$id' }] } },
+      } }, { $project: { n: 1, seconds: 1, first: 1, tracks: { $size: '$tracks' } } }],
+      trial: AUDIO_TICKER_ALLOWED_OWNERS.length
+        ? [{ $match: { owner: { $in: AUDIO_TICKER_ALLOWED_OWNERS } } }, { $count: 'n' }]
+        : [{ $count: 'n' }],
+      countries: [{ $group: { _id: '$country', n: { $sum: 1 } } }, { $sort: { n: -1 } }, { $limit: 15 }],
+      ...slotFacets,
+    } },
+  ], { allowDiskUse: true }).toArray();
+  const total = (f.total || [])[0] || { n: 0, seconds: 0, first: null, tracks: 0 };
+  // Days measured: from the first counted listen, at least one, at most the window.
+  const measuredDays = total.first
+    ? Math.min(windowDays, Math.max(1, Math.ceil((Date.now() - new Date(total.first).getTime()) / DAY_MS)))
+    : windowDays;
+  const perDay = (n) => Math.round((n / measuredDays) * 10) / 10;
+  const trialN = ((f.trial || [])[0] || {}).n || 0;
+  const catalogue = await db.collection('embed-audio')
+    .countDocuments({ status: 'published', visibility: { $ne: 'private' } }).catch(() => null);
+  return {
+    measuredDays,
+    since: total.first || null,
+    listens: total.n,
+    listensPerDay: perDay(total.n),
+    tracks: total.tracks,
+    listenHours: Math.round((total.seconds / 3600) * 10) / 10,
+    catalogue,
+    trial: AUDIO_TICKER_ALLOWED_OWNERS.length ? AUDIO_TICKER_ALLOWED_OWNERS : null,
+    trialListensPerDay: perDay(trialN),
+    slots: AD_SLOT_PERCENTS.map((percent) => {
+      const n = ((f[`p${percent}`] || [])[0] || {}).n || 0;
+      return {
+        percent,
+        perDay: perDay(n),
+        perMonth: Math.round((n / measuredDays) * 30),
+        reachPct: total.n ? Math.round((n / total.n) * 1000) / 10 : 0,
+      };
+    }),
+    countries: (f.countries || []).map((c) => ({
+      code: c._id || 'unknown',
+      sharePct: total.n ? Math.round((c.n / total.n) * 1000) / 10 : 0,
+    })),
+  };
+}
+
+async function computeUploads(db, since, windowDays) {
+  const since7 = new Date(Date.now() - 7 * DAY_MS);
+  const [f] = await db.collection('embed-video').aggregate([
+    { $match: { frontend_app: '3speak-tv', createdAt: { $gte: since } } },
+    { $facet: {
+      total: [{ $group: {
+        _id: null,
+        n: { $sum: 1 },
+        shorts: { $sum: { $cond: [{ $eq: ['$short', true] }, 1, 0] } },
+        creators: { $addToSet: '$owner' },
+      } }, { $project: { n: 1, shorts: 1, creators: { $size: '$creators' } } }],
+      recent7: [{ $match: { createdAt: { $gte: since7 } } }, { $count: 'n' }],
+    } },
+  ]).toArray();
+  const total = (f.total || [])[0] || { n: 0, shorts: 0, creators: 0 };
+  const recent7 = ((f.recent7 || [])[0] || {}).n || 0;
+  const perDay = (n) => Math.round((n / windowDays) * 10) / 10;
+  return {
+    uploads: total.n,
+    // Trailing 7 days, like the video sessions: the number a booking is likeliest to see.
+    uploadsPerDay: Math.round((recent7 / 7) * 10) / 10,
+    videosPerDay: perDay(total.n - total.shorts),
+    shortsPerDay: perDay(total.shorts),
+    creators: total.creators,
+  };
+}
+
 async function computeSnapshot() {
   const db = getDb();
   const windowDays = AD_INVENTORY_WINDOW_DAYS;
@@ -259,6 +367,14 @@ async function computeSnapshot() {
     }
   }
 
+  // The other two audiences. A failure in either leaves its tab empty, never the video one.
+  const audio = await computeAudio(db, since, windowDays, excludedOwners).catch((err) => {
+    console.error('[ad-inventory] audio audience failed:', err && err.message); return null;
+  });
+  const uploads = await computeUploads(db, since, windowDays).catch((err) => {
+    console.error('[ad-inventory] upload audience failed:', err && err.message); return null;
+  });
+
   const countries = countryRows.map((c) => ({
     code: c._id || 'unknown',
     sessions: c.sessions,
@@ -300,6 +416,8 @@ async function computeSnapshot() {
     // What a ROLL booking is quoted from: `slots` minus the no-roll creators.
     rollSlots,
     countries,
+    audio,
+    uploads,
   };
 }
 

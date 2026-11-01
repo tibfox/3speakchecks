@@ -35,6 +35,7 @@
  */
 const { getDb } = require('./db');
 const { videoAdMode } = require('./videoAdOptOut');
+const { audioAdChoice } = require('./audioAdChoice');
 const { PREMIUM_USERS_COLLECTION, AD_CREATOR_PREFS_COLLECTION, ADS_ALLOWED_OWNERS, AD_PREMIUM_OVERRIDE_ACCOUNTS , AD_SELF_VIEW_ALLOWED_ACCOUNTS } = require('./config');
 
 const TTL_MS = parseInt(process.env.AD_ELIGIBILITY_TTL_MS, 10) || 60 * 1000;
@@ -178,4 +179,53 @@ async function adDecision({ viewer, owner, permlink }) {
   return { ads: true, reason: null, rolls: true, rollsReason: null };
 }
 
-module.exports = { adDecision, isPremiumViewer, creatorOptedOut, creatorAdMode, ADS_ALLOWED_OWNERS };
+/**
+ * The account's "Ads on your audio", as it stands for a stored prefs row.
+ *
+ * An explicit choice wins. Without one it follows the creator's earlier answers:
+ * ads off, or "no rolls" (a spoken spot pauses the audio, which is what a roll does),
+ * both mean no audio spots until they switch them on. Nobody who said no to ads
+ * before audio spots existed gets them by default.
+ */
+function audioEnabledOf(doc) {
+  if (!doc) return true;
+  if (doc.adsEnabled === false) return false;
+  if (typeof doc.audioEnabled === 'boolean') return doc.audioEnabled;
+  return doc.rollsEnabled !== false;
+}
+
+/**
+ * Should this AUDIO playback carry a spoken spot? `{ ads, reason }`.
+ *
+ * The viewer-side gates are adDecision's (trial owners, own audio, premium). Then the
+ * track's own choice from the uploader, which overrides the account in EITHER
+ * direction, and only without one the account's setting (audioEnabledOf).
+ */
+async function audioAdDecision({ viewer, owner, permlink }) {
+  if (ADS_ALLOWED_OWNERS.length) {
+    const o = norm(owner);
+    if (!o || !ADS_ALLOWED_OWNERS.includes(o)) return { ads: false, reason: 'owner_not_in_trial' };
+  }
+  if (viewer && norm(viewer) === norm(owner)
+    && !AD_SELF_VIEW_ALLOWED_ACCOUNTS.includes(norm(viewer))) {
+    return { ads: false, reason: 'own_video' };
+  }
+  const premium = await isPremiumViewer(viewer);
+  if (premium === null) return { ads: false, reason: 'unknown_premium_state' };
+  if (premium) return { ads: false, reason: 'premium_viewer' };
+
+  const [track, doc] = await Promise.all([
+    audioAdChoice(owner, permlink),
+    getDb().collection(AD_CREATOR_PREFS_COLLECTION).findOne(
+      { _id: norm(owner) },
+      { projection: { adsEnabled: 1, rollsEnabled: 1, audioEnabled: 1 } },
+    ),
+  ]);
+  if (track === false) return { ads: false, reason: 'audio_opted_out' };
+  if (track === true) return { ads: true, reason: null };
+  return audioEnabledOf(doc) ? { ads: true, reason: null } : { ads: false, reason: 'creator_audio_off' };
+}
+
+module.exports = {
+  adDecision, audioAdDecision, audioEnabledOf, isPremiumViewer, creatorOptedOut, creatorAdMode, ADS_ALLOWED_OWNERS,
+};

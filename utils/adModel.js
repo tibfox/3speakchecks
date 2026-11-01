@@ -204,6 +204,9 @@ function missingAssetFor(creative) {
   if (creative.kind === CREATIVE_KINDS.TEXT) {
     return creative.message && creative.clickUrl ? null : 'creative_has_no_message';
   }
+  if (creative.kind === CREATIVE_KINDS.AUDIO) {
+    return creative.audioFile ? null : 'creative_has_no_audio';
+  }
   return creativeIsEncoded(creative) ? null : 'creative_not_encoded';
 }
 
@@ -250,6 +253,7 @@ function servableReason(campaign, creative, now = Date.now()) {
   // format rather than comparing to its single `creativeKind` is what lets it.
   if (!formatAccepts(fmt, creativeKind)) {
     if (creativeKind === CREATIVE_KINDS.TEXT) return 'creative_is_a_ticker';
+    if (creativeKind === CREATIVE_KINDS.AUDIO) return 'creative_is_audio';
     return creativeKind === CREATIVE_KINDS.IMAGE ? 'creative_is_an_image' : 'creative_is_a_video';
   }
   if (creative.status !== CREATIVE_STATES.READY) return `creative_${creative.status}`;

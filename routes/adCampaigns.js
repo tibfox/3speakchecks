@@ -32,7 +32,7 @@ const {
   AD_PAYMENT_ACCOUNT, AD_IMPRESSIONS_COLLECTION,
   AD_MIN_CAMPAIGN_DAYS, AD_MAX_CAMPAIGN_DAYS, AD_SLOT_PERCENTS, AD_LENGTH_SECONDS,
   AD_PRODUCTION_FEE_HBD, ADS_STAGE, AD_SLOT_MAX_SHARES, AD_SLOT_HOLD_HOURS, AD_DAY_CURVE_K,
-  AD_TICKER_MAX_CHARS, AD_TICKER_MAX_SECONDS,
+  AD_TICKER_MAX_CHARS, AD_TICKER_MAX_SECONDS, AD_AUDIO_SPOT_MAX_SECONDS, AD_AUDIO_SPOT_MAX_MB,
 } = require('../utils/config');
 const {
   STATES, CREATIVE_STATES, CREATIVE_KINDS, DAY_MS, ensureAdIndexes, priceForDays, ratePerDayFor,
@@ -65,6 +65,8 @@ function featureVisible(req, res, next) {
 }
 
 const { manifestUrlFor, creativeIsEncoded } = require('../utils/adGateways');
+const { previewRender } = require('../utils/adTts');
+const { processUpload: processAudioUpload } = require('../utils/adAudioSpot');
 const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 
 /* ─── shared helpers ──────────────────────────────────────────────────── */
@@ -268,8 +270,10 @@ function publicCreative(cr) {
     embedId: cr.embedId,
     kind: cr.kind || CREATIVE_KINDS.VIDEO,
     imageUrl: cr.imageUrl || null,
-    // A ticker's text and where it links. Null on every other kind.
+    // A ticker's text and where it links (an audio spot has a link too). Null otherwise.
     message: cr.message || null,
+    // An audio spot's levelled file, as the listener gets it. Relative to the checker.
+    audioPath: cr.kind === CREATIVE_KINDS.AUDIO && cr.audioFile ? `/m/tts/${cr.audioFile}` : null,
     clickUrl: cr.clickUrl || null,
     tickerStyle: cr.kind === CREATIVE_KINDS.TEXT ? (cr.style || 'crawl') : null,
     // The readability minimum for this message, so the booking form can default to it.
@@ -343,6 +347,8 @@ function publicCampaign(c, creative, watch = null) {
     // the raw field.
     format: formatOf(c).key,
     formatLabel: formatOf(c).label,
+    // Video tickers only: is it read aloud in the audio player too? Absent = yes.
+    audioSpot: formatOf(c).key === 'video_ticker' ? c.audioSpot !== false : null,
     creativeKind: formatOf(c).creativeKind,
     // EVERY kind this flight can run, not just the one its copy leads with. The
     // banner takes a still or a video; publishing only the singular is what made the
@@ -836,6 +842,9 @@ router.post('/campaigns', featureVisible, express.json({ limit: '32kb' }), async
       // utils/adFormats.js — but only campaigns booked BEFORE formats existed should
       // ever be relying on that default.
       format: formatKey,
+      // A video ticker is also read aloud in the audio player unless the advertiser
+      // turns that off (the "Also play on audio" switch). Only the ticker has it.
+      ...(formatKey === 'video_ticker' ? { audioSpot: b.audioSpot !== false } : {}),
       status: STATES.AWAITING_PAYMENT,
       slotPercent,
       days,
@@ -1022,6 +1031,37 @@ router.post('/campaigns/:id/creative', featureVisible, express.json({ limit: '16
       const creative = await db.collection(AD_CREATIVES_COLLECTION).findOne({ embedId: key });
       const fresh = await db.collection(AD_CAMPAIGNS_COLLECTION).findOne({ _id: id });
       return res.json({ success: true, campaign: publicCampaign(fresh, creative) });
+    }
+
+    /* An AUDIO SPOT: an uploaded clip already on record (POST /creatives/audio), by key.
+     * The booked length has to hold the whole clip, as for a video spot. */
+    if (formatAccepts(fmt, CREATIVE_KINDS.AUDIO) || sentKey.startsWith('aud:')) {
+      if (!sentKey.startsWith('aud:') || !formatAccepts(fmt, CREATIVE_KINDS.AUDIO)) {
+        return res.status(400).json({
+          success: false,
+          error: formatAccepts(fmt, CREATIVE_KINDS.AUDIO)
+            ? 'An audio spot runs an uploaded audio file. Send the key of one you uploaded.'
+            : `A ${fmt.label.toLowerCase()} cannot run an audio file.`,
+        });
+      }
+      const own = await db.collection(AD_CREATIVES_COLLECTION)
+        .findOne({ embedId: sentKey, advertiserRef: advertiser.reference, kind: CREATIVE_KINDS.AUDIO });
+      if (!own) return res.status(404).json({ success: false, error: 'That audio file was not found' });
+      const booked = Number(campaign.spotSeconds) || 0;
+      const needs = Math.ceil(Number(own.durationSeconds) || 0);
+      if (booked > 0 && booked < needs) {
+        return res.status(400).json({
+          success: false,
+          error: `This clip is ${needs} seconds and this booking is ${booked}. Book ${needs} seconds or more, or upload a shorter clip.`,
+          minSeconds: needs,
+        });
+      }
+      await db.collection(AD_CAMPAIGNS_COLLECTION).updateOne(
+        { _id: id },
+        { $set: { creativeEmbedId: sentKey, updatedAt: new Date() } },
+      );
+      const fresh = await db.collection(AD_CAMPAIGNS_COLLECTION).findOne({ _id: id });
+      return res.json({ success: true, campaign: publicCampaign(fresh, own), creative: publicCreative(own) });
     }
 
     /* Which path this attach takes is decided by WHAT WAS SENT, not by the format.
@@ -1386,6 +1426,149 @@ router.get('/creatives', featureVisible, async (req, res) => {
 // Verifies the on-chain payment and schedules the flight. The work is in
 // services/adPaymentClaim.js, shared with services/adPaymentWatch.js, which runs
 // the same claim on its own for every unpaid booking whose memo turns up on chain.
+/* ─── POST /advertise/campaigns/:id/audio — a ticker on audio, or not ──── */
+// The advertiser's switch for one video ticker flight: { reference, audioSpot }.
+// Takes effect on the next audio session; nothing already playing is touched.
+router.post('/campaigns/:id/audio', featureVisible, express.json({ limit: '2kb' }), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const advertiser = await applicantAdvertiser(str(b.reference, 64));
+    if (!advertiser) return res.status(403).json({ success: false, error: 'No product for that reference' });
+    const id = oid(req.params.id);
+    if (!id) return res.status(400).json({ success: false, error: 'Invalid campaign id' });
+    if (typeof b.audioSpot !== 'boolean') return res.status(400).json({ success: false, error: 'audioSpot must be true or false' });
+    const db = getDb();
+    const campaign = await db.collection(AD_CAMPAIGNS_COLLECTION).findOne({ _id: id, advertiserRef: advertiser.reference });
+    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+    if (formatOf(campaign).key !== 'video_ticker') {
+      return res.status(400).json({ success: false, error: 'Only a ticker flight has an audio switch.' });
+    }
+    await db.collection(AD_CAMPAIGNS_COLLECTION).updateOne(
+      { _id: id },
+      { $set: { audioSpot: b.audioSpot, updatedAt: new Date() } },
+    );
+    return res.json({ success: true, audioSpot: b.audioSpot });
+  } catch (err) {
+    console.error('[advertise] audio switch failed:', err && err.message);
+    return res.status(500).json({ success: false, error: 'Could not save that. Try again.' });
+  }
+});
+
+/* ─── POST /advertise/creatives/audio — upload an audio spot's clip ─────── */
+// The file is the raw request body (any audio Content-Type); reference and the https
+// link for "Find out more" ride in the query string. Levelled and stored by
+// utils/adAudioSpot.js, then saved as an AUDIO creative in review. The response's
+// creative.audioPath plays the stored file: exactly what a listener will hear.
+// 🚨 nginx needs client_max_body_size for this path (default is 1 MB).
+const audioUploads = new Map();   // reference -> upload timestamps in the last hour
+const AUDIO_UPLOADS_PER_HOUR = 20;
+router.post('/creatives/audio', featureVisible,
+  express.raw({ type: () => true, limit: `${AD_AUDIO_SPOT_MAX_MB}mb` }),
+  async (req, res) => {
+    try {
+      await ensureAdIndexes();
+      const advertiser = await applicantAdvertiser(str(req.query.reference, 64));
+      if (!advertiser) return res.status(403).json({ success: false, error: 'No advertiser application for that reference' });
+      let url = null;
+      try { url = new URL(str(req.query.clickUrl, 500)); } catch { url = null; }
+      if (!url || url.protocol !== 'https:') {
+        return res.status(400).json({ success: false, error: 'The link has to be a full https:// address.' });
+      }
+      const clickUrl = url.toString();
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ success: false, error: 'Send the audio file.' });
+      }
+      const now = Date.now();
+      const recent = (audioUploads.get(advertiser.reference) || []).filter((t) => now - t < 3600 * 1000);
+      if (recent.length >= AUDIO_UPLOADS_PER_HOUR) {
+        return res.status(429).json({ success: false, error: 'That is a lot of uploads for one hour. Try again a little later.' });
+      }
+      recent.push(now);
+      audioUploads.set(advertiser.reference, recent);
+
+      let out;
+      try {
+        out = await processAudioUpload(req.body, { maxSeconds: AD_AUDIO_SPOT_MAX_SECONDS });
+      } catch (err) {
+        const known = {
+          audio_not_supported: [400, 'We could not read that as audio. Send an MP3, WAV, M4A, OGG, FLAC or WebM file.'],
+          audio_no_stream: [400, 'That file has no sound in it.'],
+          audio_too_short: [400, 'That clip is too short to be a spot.'],
+          audio_too_long: [400, `That clip is ${err.seconds}s. An audio spot can be at most ${err.max}s.`],
+          audio_busy: [429, 'A few files are being processed right now. Try again in a moment.'],
+          audio_failed: [500, 'Could not process that file. Try another one.'],
+        }[err && err.code];
+        if (!known) throw err;
+        return res.status(known[0]).json({ success: false, error: known[1], code: err.code });
+      }
+
+      const key = `aud:${crypto.createHash('sha1')
+        .update(`${advertiser.reference}\n${out.sha1}\n${clickUrl}`).digest('hex').slice(0, 24)}`;
+      if (!(await underPendingCap(advertiser, key))) return res.status(429).json(CAP_REFUSAL);
+      const db = getDb();
+      const prior = await db.collection(AD_CREATIVES_COLLECTION).findOne({ embedId: key });
+      const settled = prior
+        && (prior.status === CREATIVE_STATES.READY || prior.status === CREATIVE_STATES.REJECTED);
+      await db.collection(AD_CREATIVES_COLLECTION).updateOne(
+        { embedId: key },
+        {
+          $set: {
+            advertiserRef: advertiser.reference,
+            kind: CREATIVE_KINDS.AUDIO,
+            audioFile: out.file,
+            clickUrl,
+            owner: advertiser.hiveAccount,
+            durationSeconds: out.durationSeconds,
+            manifestCid: null,
+            status: settled ? prior.status : CREATIVE_STATES.REVIEW,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { embedId: key, campaignId: null, reviewNote: null, createdAt: new Date() },
+        },
+        { upsert: true },
+      );
+      const saved = await db.collection(AD_CREATIVES_COLLECTION).findOne({ embedId: key });
+      return res.status(201).json({ success: true, creative: publicCreative(saved) });
+    } catch (err) {
+      console.error('[advertise] audio upload failed:', err && err.message);
+      return res.status(500).json({ success: false, error: 'Could not save that file. Try again.' });
+    }
+  });
+
+/* ─── POST /advertise/creatives/listen — hear a ticker before saving it ── */
+// { reference, message, clickUrl } -> { audioUrl, durationSeconds, text }. The exact
+// file a listener would get (utils/adTts.js previewRender). Nothing is saved or sent
+// to review; the message is checked by the same rules as Save.
+router.post('/creatives/listen', featureVisible, express.json({ limit: '8kb' }), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const advertiser = await applicantAdvertiser(str(b.reference, 64));
+    if (!advertiser) return res.status(403).json({ success: false, error: 'No advertiser application for that reference' });
+    const t = tickerText(b);
+    if (t.error) return res.status(400).json({ success: false, error: t.error });
+    const r = await previewRender(getDb(), t, advertiser, advertiser.reference);
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      success: true,
+      audioUrl: `${proto}://${host}/m/tts/${r.file}`,
+      durationSeconds: r.durationSeconds,
+      text: r.text,
+    });
+  } catch (err) {
+    const known = {
+      tts_unavailable: [503, 'Listening is not available right now.'],
+      tts_busy: [429, 'A few previews are being made right now. Try again in a moment.'],
+      tts_limit: [429, 'That is a lot of previews for one hour. Try again a little later.'],
+      tts_failed: [500, 'Could not make the preview. Try again.'],
+    }[err && err.code];
+    if (!known) console.error('[advertise] ticker listen failed:', err && err.message);
+    const [status, error] = known || [500, 'Could not make the preview. Try again.'];
+    return res.status(status).json({ success: false, error, code: (err && err.code) || null });
+  }
+});
+
 router.post('/campaigns/:id/claim', featureVisible, express.json({ limit: '8kb' }), async (req, res) => {
   try {
     const id = oid(req.params.id);
