@@ -220,6 +220,19 @@ module.exports = {
     INTEREST_RECENCY_TILT: parseFloat(process.env.INTEREST_RECENCY_TILT ?? '0.35'),
     INTEREST_RECENCY_DAYS: parseFloat(process.env.INTEREST_RECENCY_DAYS ?? '21'),
 
+    // ─── Pulse hot set (Mantequilla-Soft/3speakchecks#93) ───
+    // Read-only list of OLD videos people are watching, for Video Pulse to restore to
+    // a hotnode. GET /pulse/hot-set, its own key (not API_SECRET_KEY). Off by default:
+    // with the flag off the build never runs and the route 404s. See
+    // services/pulseHotSet.js.
+    PULSE_HOTSET_ENABLED: parseBool(process.env.PULSE_HOTSET_ENABLED, false),
+    PULSE_API_KEY: process.env.PULSE_API_KEY || '',
+    PULSE_HOTSET_WINDOW_HOURS: parseInt(process.env.PULSE_HOTSET_WINDOW_HOURS) || 48,
+    PULSE_HOTSET_MIN_SESSIONS: parseInt(process.env.PULSE_HOTSET_MIN_SESSIONS) || 5,
+    PULSE_HOTSET_MIN_AGE_DAYS: parseInt(process.env.PULSE_HOTSET_MIN_AGE_DAYS) || 30,
+    PULSE_HOTSET_LIMIT: parseInt(process.env.PULSE_HOTSET_LIMIT) || 500,
+    PULSE_HOTSET_INTERVAL_MIN: parseInt(process.env.PULSE_HOTSET_INTERVAL_MIN) || 30,
+
     // ─── Shorts candidate window (/shortssorted) ──────────────────────────────
     // The default 30-day window (was 14 until 2026-09-29, when heavy viewers were
     // getting close to watching the whole feed) is sized for the GLOBAL pool. A
