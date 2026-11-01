@@ -180,6 +180,66 @@ function fromAudio(a) {
     };
 }
 
+// The audio uploader writes the show notes into the Hive post only: the row's
+// `description` has been empty for every upload since May 2026, which left
+// those items with nothing but the watch link. Fill title and notes from the
+// post itself. Cached per post, since a playlist feed can carry 300 of them.
+const HIVE_POST_TTL_MS = 60 * 60 * 1000;
+const HIVE_POST_CACHE_MAX = 5000;
+const hivePostCache = new Map();               // "owner/permlink" -> { at, title, text }
+
+/** A post body as plain show notes: no images, no player link, no markup. */
+function showNotesFromBody(body) {
+    return String(body || '')
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                       // markdown images
+        .replace(/<img[^>]*>/gi, '')
+        .replace(/^\s*https?:\/\/audio\.3speak\.tv\/play\S*\s*$/gim, '') // the embedded player
+        .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')                // [text](url) -> text url
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/]]>/g, ']] >')                                   // never close our CDATA
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
+ * Audio episodes without a stored description get the Hive post's title and
+ * body. Mutates and returns `episodes`. A Hive outage leaves them as they were.
+ */
+async function withHivePostText(episodes) {
+    const now = Date.now();
+    const wanted = episodes.filter((e) => e.kind === 'audio' && !e.description && e.owner && e.permlink);
+    const missing = [...new Set(wanted.map((e) => `${e.owner}/${e.permlink}`))]
+        .filter((k) => !(now - (hivePostCache.get(k)?.at || 0) < HIVE_POST_TTL_MS));
+
+    for (let i = 0; i < missing.length; i += 50) {
+        const chunk = missing.slice(i, i + 50);
+        try {
+            const results = await hiveRpcBatch(chunk.map((k, n) => ({
+                jsonrpc: '2.0', id: n, method: 'condenser_api.get_content', params: k.split('/'),
+            })));
+            for (const r of results) {
+                const key = chunk[r?.id];
+                const post = r?.result;
+                if (!key || !post || !post.author) continue;
+                hivePostCache.set(key, { at: now, title: post.title || '', text: showNotesFromBody(post.body) });
+            }
+        } catch (err) {
+            console.warn('[RSS] Could not read Hive posts for show notes:', err.message);
+        }
+    }
+    while (hivePostCache.size > HIVE_POST_CACHE_MAX) hivePostCache.delete(hivePostCache.keys().next().value);
+
+    for (const e of wanted) {
+        const post = hivePostCache.get(`${e.owner}/${e.permlink}`);
+        if (!post) continue;
+        if (post.title) e.title = post.title;
+        if (post.text) e.description = post.text.replace(/\n/g, '<br>');
+    }
+    return episodes;
+}
+
 /** RFC 4122 UUIDv5 (SHA-1, name-based). */
 function uuidv5(name, namespace) {
     const ns = Buffer.from(namespace.replace(/-/g, ''), 'hex');
@@ -346,11 +406,9 @@ function buildItem(video, itunesAuthor, feedOwner) {
                     `${hiveDomain}/@${video.owner}/${video.permlink}`
                 ]
             },
-            {
-                description: {
-                    _cdata: `${watchLink} <br> ${video.description || ''}`
-                }
-            },
+            // The notes alone: apps show the description's opening lines, and the
+            // watch link is already the item's <link>. Link only when there are none.
+            { description: { _cdata: video.description || watchLink } },
             {
                 image: {
                     _attr: {
@@ -701,7 +759,7 @@ async function loadPublicPlaylist(db, id) {
                 })
                 .toArray(),
         ]);
-        episodes = mergeEpisodes({ embedRaw, legacyRaw, audioRaw }, PLAYLIST_FEED_LIMIT);
+        episodes = await withHivePostText(mergeEpisodes({ embedRaw, legacyRaw, audioRaw }, PLAYLIST_FEED_LIMIT));
     }
     return { playlist, blocked: false, live, episodes };
 }
@@ -898,7 +956,7 @@ router.get('/:username.xml', async (req, res) => {
                 .sort({ createdAt: -1 }).limit(FEED_LIMIT).toArray(),
         ]);
 
-        const videos = mergeEpisodes({ embedRaw, legacyRaw, audioRaw }, FEED_LIMIT);
+        const videos = await withHivePostText(mergeEpisodes({ embedRaw, legacyRaw, audioRaw }, FEED_LIMIT));
 
         if (videos.length === 0) {
             // No published videos — return a minimal valid empty feed
