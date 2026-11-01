@@ -6,6 +6,14 @@ const parseBool = (v, fallback) => {
     return String(v).toLowerCase() === 'true';
 };
 
+// An integer setting with a floor: unset, non-numeric or below `min` falls back.
+// Unlike `parseInt(v) || fallback`, a configured 0 is kept when min allows it.
+const parseIntMin = (v, fallback, min) => {
+    if (v === undefined || v === null || String(v).trim() === '') return fallback;
+    const n = Number(v);
+    return Number.isInteger(n) && n >= min ? n : fallback;
+};
+
 /* ─── the ad revenue split ────────────────────────────────────────────────
  * Resolved out here rather than inline in the object below, because the two
  * numbers are not independent: together they must leave the platform a share it
@@ -219,6 +227,21 @@ module.exports = {
     // topic match and quality still dominate, this just breaks ties toward newer.
     INTEREST_RECENCY_TILT: parseFloat(process.env.INTEREST_RECENCY_TILT ?? '0.35'),
     INTEREST_RECENCY_DAYS: parseFloat(process.env.INTEREST_RECENCY_DAYS ?? '21'),
+
+    // ─── Pulse hot set (Mantequilla-Soft/3speakchecks#93) ───
+    // Read-only list of OLD videos people are watching, for Video Pulse to restore to
+    // a hotnode. GET /pulse/hot-set, its own key (not API_SECRET_KEY). Off by default:
+    // with the flag off the build never runs and the route 404s. See
+    // services/pulseHotSet.js.
+    PULSE_HOTSET_ENABLED: parseBool(process.env.PULSE_HOTSET_ENABLED, false),
+    PULSE_API_KEY: process.env.PULSE_API_KEY || '',
+    // parseIntMin, not `parseInt() || n`: MIN_AGE_DAYS=0 ("any age") is a real
+    // setting, and a negative LIMIT would slice the list from the wrong end.
+    PULSE_HOTSET_WINDOW_HOURS: parseIntMin(process.env.PULSE_HOTSET_WINDOW_HOURS, 48, 1),
+    PULSE_HOTSET_MIN_SESSIONS: parseIntMin(process.env.PULSE_HOTSET_MIN_SESSIONS, 5, 1),
+    PULSE_HOTSET_MIN_AGE_DAYS: parseIntMin(process.env.PULSE_HOTSET_MIN_AGE_DAYS, 30, 0),
+    PULSE_HOTSET_LIMIT: parseIntMin(process.env.PULSE_HOTSET_LIMIT, 500, 1),
+    PULSE_HOTSET_INTERVAL_MIN: parseIntMin(process.env.PULSE_HOTSET_INTERVAL_MIN, 30, 1),
 
     // ─── Shorts candidate window (/shortssorted) ──────────────────────────────
     // The default 30-day window (was 14 until 2026-09-29, when heavy viewers were

@@ -151,6 +151,7 @@ app.use('/incubation', incubationRoutes); // same ordering rule as above
 app.use('/badges', badgeRoutes);          // same ordering rule as above
 app.use('/', announcementRoutes);         // same ordering rule as above
 app.use('/', require('./routes/stories')); // 24h stories row + follower notifications; same ordering rule
+app.use('/pulse', require('./routes/pulse')); // Video Pulse hot set (#93); same ordering rule
 app.use('/', streamStatsRoutes);
 
 // Track whether heavy sync tasks are running
@@ -494,6 +495,10 @@ async function startServer() {
     // from Hive into `video-stats`. Populated by what the feeds actually serve —
     // see services/videoStats.js. No-op unless VIDEO_STATS_ENABLED.
     scheduleVideoStats();
+
+    // Pulse hot set: old videos being watched again, for Video Pulse to restore to a
+    // hotnode (#93). Read-only, in memory. No-op unless PULSE_HOTSET_ENABLED.
+    require('./services/pulseHotSet').schedulePulseHotSet();
 
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
