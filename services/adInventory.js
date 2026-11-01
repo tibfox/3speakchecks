@@ -491,4 +491,24 @@ async function forecastPerDay({ percent, minVideoSeconds, maxVideoSeconds, roll 
   }
 }
 
-module.exports = { runOnce, getSnapshot, computeSnapshot, forecastPerDay };
+/**
+ * The audio and upload audiences straight from their collections, for a snapshot that
+ * does not carry them yet (written before they existed, or before the first run after
+ * a restart). The data is always there; only the cached copy can be missing.
+ */
+async function liveAudiences(snap) {
+  const db = getDb();
+  const windowDays = (snap && snap.windowDays) || AD_INVENTORY_WINDOW_DAYS;
+  const since = new Date(Date.now() - windowDays * DAY_MS);
+  const excluded = (snap && snap.excluded) ? [
+    ...((snap.excluded.suspectAccounts || []).map((s) => s.owner)),
+    ...(snap.excluded.optedOutAccounts || []),
+  ] : [];
+  const [audio, uploads] = await Promise.all([
+    snap && snap.audio ? snap.audio : computeAudio(db, since, windowDays, excluded).catch(() => null),
+    snap && snap.uploads ? snap.uploads : computeUploads(db, since, windowDays).catch(() => null),
+  ]);
+  return { audio, uploads };
+}
+
+module.exports = { runOnce, getSnapshot, computeSnapshot, forecastPerDay, liveAudiences };
