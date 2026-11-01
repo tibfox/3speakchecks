@@ -406,11 +406,9 @@ function buildItem(video, itunesAuthor, feedOwner) {
                     `${hiveDomain}/@${video.owner}/${video.permlink}`
                 ]
             },
-            {
-                description: {
-                    _cdata: `${watchLink} <br> ${video.description || ''}`
-                }
-            },
+            // The notes alone: apps show the description's opening lines, and the
+            // watch link is already the item's <link>. Link only when there are none.
+            { description: { _cdata: video.description || watchLink } },
             {
                 image: {
                     _attr: {
