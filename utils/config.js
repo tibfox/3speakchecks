@@ -1044,6 +1044,17 @@ module.exports = {
     /* Who may BOOK a ticker. True = only ADS_BETA_USERS. Public (false) since
      * 2026-10-01; set true to put it back behind the beta. */
     AD_TICKER_BETA_ONLY: parseBool(process.env.AD_TICKER_BETA_ONLY, false),
+    /* THE AUDIO SPOT (format audio_spot): the advertiser's OWN audio file, played in the
+     * audio player, never on a video. (Only the ticker is spoken by us.) Priced a little
+     * under the ticker (owner, 2026-11-01: "a bit cheaper"), as a share of the ticker's
+     * LIVE rate, so it moves with it. A stored `set-rate audio_spot` overrides it.
+     * Bookable only by ADS_BETA_USERS while true: audio spots play on the audio of
+     * AD_AUDIO_TICKER_ALLOWED_OWNERS only (default badadib), too little to sell openly. */
+    AD_AUDIO_SPOT_RATE_OF_TICKER: parseFloat(process.env.AD_AUDIO_SPOT_RATE_OF_TICKER) || 0.75,
+    AD_AUDIO_SPOT_BETA_ONLY: parseBool(process.env.AD_AUDIO_SPOT_BETA_ONLY, true),
+    // Longest clip, and largest upload before it is levelled and re-encoded.
+    AD_AUDIO_SPOT_MAX_SECONDS: parseInt(process.env.AD_AUDIO_SPOT_MAX_SECONDS) || 30,
+    AD_AUDIO_SPOT_MAX_MB: parseInt(process.env.AD_AUDIO_SPOT_MAX_MB) || 20,
     // The pre-upload spot. Priced ABOVE a roll: it is unskippable, it is the only
     // thing on screen, and the audience is creators rather than passers-by, which is
     // the most valuable audience on the platform to anyone selling to creators.

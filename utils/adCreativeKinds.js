@@ -17,6 +17,7 @@
  */
 // TEXT is a ticker message plus its link: no file at all. It still lives in the
 // creatives collection so it goes through the same human review as everything else.
-const CREATIVE_KINDS = Object.freeze({ VIDEO: 'video', IMAGE: 'image', TEXT: 'text' });
+// AUDIO is an uploaded sound file (the audio spot), levelled and stored by the checker.
+const CREATIVE_KINDS = Object.freeze({ VIDEO: 'video', IMAGE: 'image', TEXT: 'text', AUDIO: 'audio' });
 
 module.exports = { CREATIVE_KINDS };

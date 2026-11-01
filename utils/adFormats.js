@@ -87,6 +87,7 @@ const {
   AD_SHORTS_MAX_ASPECT, AD_SHORTS_MIN_WIDTH, AD_SHORTS_RECOMMENDED,
   AD_TICKER_RATE_OF_BANNER, AD_TICKER_MAX_SECONDS,
   AD_TICKER_BASE_SECONDS, AD_TICKER_SECONDS_PER_WORD, AD_TICKER_MIN_SECONDS, AD_TICKER_MAX_CHARS, AD_TICKER_BETA_ONLY,
+  AD_AUDIO_SPOT_RATE_OF_TICKER, AD_AUDIO_SPOT_BETA_ONLY, AD_AUDIO_SPOT_MAX_SECONDS, AD_AUDIO_SPOT_MAX_MB,
 } = require('./config');
 const { CREATIVE_KINDS } = require('./adCreativeKinds');
 const { platformRate } = require('./adSettings');
@@ -279,6 +280,39 @@ const FORMATS = Object.freeze({
       minSeconds: Object.freeze({ base: AD_TICKER_BASE_SECONDS, perWord: AD_TICKER_SECONDS_PER_WORD, floor: AD_TICKER_MIN_SECONDS }),
     }),
   }),
+
+  /**
+   * The advertiser's OWN audio clip, played in the 3speak.tv audio player at the booked
+   * position: the track pauses, the clip plays, the track carries on. The player shows
+   * the Ad label, the advertiser and a "Find out more" button for their link while it
+   * plays. Never on a video. (A video ticker is the format that is ALSO spoken; this
+   * one is not text at all.)
+   *
+   * Uploaded to the checker (POST /advertise/creatives/audio), levelled to the same
+   * loudness as the spoken tickers and stored as an MP3 (utils/adAudioSpot.js), then
+   * reviewed by a person like every other creative.
+   *
+   * `surface: 'audio'` keeps it off the watch surface (adServe filters it out there),
+   * and leaves the forecast empty: the inventory forecast counts video plays.
+   */
+  audio_spot: Object.freeze({
+    key: 'audio_spot',
+    label: 'Audio spot',
+    blurb: 'Your own audio clip, played in the audio player between parts of a track. Your link shows as a button while it plays.',
+    creativeKind: CREATIVE_KINDS.AUDIO,
+    surface: 'audio',
+    creatorCredit: CREATOR_CREDIT.VIDEO_OWNER,
+    payoutPool: PAYOUT_POOLS.WATCH,
+    positioned: true,
+    burnsIn: false,
+    beta: AD_AUDIO_SPOT_BETA_ONLY,
+    maxSeconds: AD_AUDIO_SPOT_MAX_SECONDS,
+    // Compiled fallback only. The real default follows the ticker; see defaultRateFor().
+    ratePerSecondDayHbd: Math.round(AD_BANNER_PRICE_PER_SECOND_DAY_HBD * AD_TICKER_RATE_OF_BANNER
+      * AD_AUDIO_SPOT_RATE_OF_TICKER * 1e6) / 1e6,
+    rateFollows: Object.freeze({ format: 'video_ticker', factor: AD_AUDIO_SPOT_RATE_OF_TICKER }),
+    creativeSpec: Object.freeze({ maxMb: AD_AUDIO_SPOT_MAX_MB }),
+  }),
 });
 
 /** The format every campaign booked before formats existed is on. */
@@ -404,7 +438,8 @@ function rateFor(advertiser, formatKey) {
  */
 function defaultRateFor(formatKey) {
   const fmt = FORMATS[String(formatKey || '').trim()] || FORMATS[DEFAULT_FORMAT];
-  /* A format priced as a share of another (the ticker: half the banner) takes that
+  /* A format priced as a share of another (the ticker: half the banner; the audio
+   * spot: a share of the ticker, so a chain) takes that
    * format's LIVE default times the factor, unless it has a stored override of its
    * own. Rounded to the thousandth, the precision every other rate is quoted in. */
   if (fmt.rateFollows) {

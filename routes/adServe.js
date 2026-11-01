@@ -31,9 +31,10 @@
  */
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
 const router = express.Router();
 const { getDb } = require('../utils/db');
-const { adDecision, isPremiumViewer } = require('../utils/adEligibility');
+const { adDecision, audioAdDecision, isPremiumViewer } = require('../utils/adEligibility');
 const {
   AD_CAMPAIGNS_COLLECTION, AD_CREATIVES_COLLECTION, AD_IMPRESSIONS_COLLECTION, ADVERTISERS_COLLECTION,
   AD_SELFPROMO_ALLOWED_OWNERS, AD_TICKER_ALLOWED_OWNERS, AD_TICKER_FREQUENCY_CAP_MINUTES,
@@ -52,8 +53,20 @@ const { knownShape, shapeWithin, targetFor, conformedSegment, conformOn } = requ
 const { formatOf } = require('../utils/adFormats');
 const { burnSegment } = require('../services/adBurner');
 const { isDatacenterIp } = require('../utils/datacenterIp');
+const {
+  AUDIO_TICKER_ENABLED, audioTickerAllowedOn, readyRendersFor, ttsFilePath,
+} = require('../utils/adTts');
 
 const SESSIONS = process.env.AD_SESSIONS_COLLECTION || 'ad_sessions';
+/* Owners whose content skips the two rules keyed on the viewer's ADDRESS: one ad per
+ * address per video per day, and no ads for a connection linked to the owner.
+ * DEFAULT badadib (owner, 2026-11-01): the platform's own test channel, paid nothing
+ * (AD_EXCLUDED_ACCOUNTS), so testing from the team's own networks has to work.
+ * Every other cap (per campaign, per viewer / browser, rate limit, datacenter) stays.
+ * Set-but-empty = nobody exempt. */
+const AD_IP_CAP_EXEMPT_OWNERS = String(process.env.AD_IP_CAP_EXEMPT_OWNERS ?? 'badadib')
+  .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+const ipCapExempt = (owner) => AD_IP_CAP_EXEMPT_OWNERS.includes(String(owner || '').toLowerCase());
 const FETCH_TIMEOUT_MS = parseInt(process.env.AD_FETCH_TIMEOUT_MS, 10) || 6000;
 const ID_RE = /^[a-z0-9._-]+$/i;
 const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
@@ -949,6 +962,170 @@ function publicBaseOf(req) {
   return `${proto}://${host}`;
 }
 
+/* ─── the AUDIO surface: a ticker, spoken ─────────────────────────────────
+ *
+ * The 3speak.tv audio player asks with `surface: 'audio'`, `audioSpot: true` and
+ * the embed-audio permlink. What it gets is a ticker campaign's message rendered to
+ * speech (utils/adTts.js), which it plays at the booked position by pausing the
+ * track, then resuming it. Nothing is spliced: the creator's file is untouched.
+ *
+ * It IS the ticker: the same campaigns, approval gate,
+ * flight window, frequency cap (a ticker heard on audio counts against the same
+ * window as one seen on a video), click route (/tc) and impression route
+ * (/ticker-shown, flagged `audio: true`). The impression carries the audio's HIVE
+ * permlink, so payout finds its community on chain like it does for a video.
+ *
+ * Narrower than the video ticker on purpose:
+ *   - only owners in AD_AUDIO_TICKER_ALLOWED_OWNERS (default badadib);
+ *   - the creator's own audio settings decide (utils/adEligibility.js
+ *     audioAdDecision): "Ads on your audio", overridden per track by the uploader;
+ *   - a video ticker's booking can refuse audio (`audioSpot: false`, the advertiser's
+ *     switch on /advertise);
+ *   - only a message whose speech is rendered; until then it simply is not offered.
+ *
+ * The AUDIO SPOT format (`audio_spot`) rides the same path with the advertiser's own
+ * uploaded clip (utils/adAudioSpot.js) instead of speech, and no text: the player
+ * shows the Ad label, the advertiser and the link. Same caps, click and impression. */
+async function serveAudioSpot({ req, res, db, b, owner, permlink, viewer, capId, country, app, decision }) {
+  if (!AUDIO_TICKER_ENABLED) return res.json({ ad: null, reason: 'audio_ads_off' });
+  // Only a player that can play one is handed one.
+  if (!(b.audioSpot === true || String(b.audioSpot) === 'true')) return res.json({ ad: null, reason: 'no_audio_spot' });
+  if (!audioTickerAllowedOn(owner)) return res.json({ ad: null, reason: 'owner_not_in_trial' });
+  // The creator's audio choice (account + this track) was decided in audioAdDecision.
+  if (!decision.ads) return res.json({ ad: null, reason: decision.reason });
+
+  // The track has to exist and be this owner's: the owner is who gets paid.
+  const track = await db.collection('embed-audio').findOne(
+    { permlink, owner },
+    { projection: { post_permlink: 1, duration: 1, mp3_duration: 1, status: 1 } },
+  );
+  if (!track || (track.status && track.status !== 'published')) return res.json({ ad: null, reason: 'no_audio' });
+  const trackSeconds = Number(track.duration) || Number(track.mp3_duration) || null;
+
+  const now = new Date();
+  const candidates = await db.collection(AD_CAMPAIGNS_COLLECTION).find({
+    format: { $in: ['video_ticker', 'audio_spot'] },
+    audioSpot: { $ne: false },
+    ...selfPromoFilter(owner),
+    status: { $in: [STATES.SCHEDULED, STATES.RUNNING] },
+    startAt: { $lte: now },
+    endAt: { $gt: now },
+  }).limit(50).toArray();
+  if (!candidates.length) return res.json({ ad: null, reason: 'no_campaign' });
+
+  const byCampaign = await creativesByCampaign(db, candidates);
+  const refs = [...new Set(candidates.map((c) => c.advertiserRef).filter(Boolean))];
+  const brands = new Map((await db.collection(ADVERTISERS_COLLECTION).find(
+    { reference: { $in: refs } },
+    { projection: { reference: 1, status: 1, hiveAccount: 1, projectName: 1 } },
+  ).toArray()).map((d) => [d.reference, d]));
+
+  const capKey = viewer ? { viewer } : (capId ? { capId } : null);
+  const { recentTicker } = await seenCampaigns(db, capKey);
+  const claimedKeys = claimedAdKeys(b);
+
+  const eligible = candidates.filter((c) => {
+    // The approval gate, failing closed exactly as on the watch surface.
+    const brand = c.advertiserRef ? brands.get(c.advertiserRef) : null;
+    if (!brand || brand.status !== 'approved') return false;
+    if (servableReason(c, byCampaign.get(String(c._id)))) return false;
+    if (recentTicker.has(String(c._id)) || claimedKeys.has(adKeyOf(c._id))) return false;
+    if (c.markets && c.markets.length && country && !c.markets.includes(country)) return false;
+    // Length targeting reads the track's length the way it reads a video's.
+    if (c.minVideoSeconds || c.maxVideoSeconds) {
+      if (!trackSeconds) return false;
+      if (c.minVideoSeconds && trackSeconds < c.minVideoSeconds) return false;
+      if (c.maxVideoSeconds && trackSeconds > c.maxVideoSeconds) return false;
+    }
+    return true;
+  });
+  if (!eligible.length) return res.json({ ad: null, reason: 'no_eligible_campaign' });
+
+  // What each one would play: a ticker's rendered speech, or an audio spot's own file.
+  const tickers = eligible.filter((c) => formatOf(c).key === 'video_ticker');
+  const renders = await readyRendersFor(db, tickers.map((c) => ({
+    creative: byCampaign.get(String(c._id)), brand: brands.get(c.advertiserRef),
+  })));
+  const soundOf = (c) => {
+    const cr = byCampaign.get(String(c._id));
+    if (formatOf(c).key === 'audio_spot') {
+      return cr && cr.audioFile && ttsFilePath(cr.audioFile) && fs.existsSync(ttsFilePath(cr.audioFile))
+        ? { hash: cr.audioFile.replace(/\.mp3$/, ''), file: cr.audioFile, durationSeconds: cr.durationSeconds }
+        : null;
+    }
+    return renders.get(cr.embedId) || null;
+  };
+  const playable = eligible.filter((c) => soundOf(c));
+  if (!playable.length) return res.json({ ad: null, reason: 'no_rendered_audio' });
+  playable.sort((x, y) => (x.deliveredImpressions || 0) - (y.deliveredImpressions || 0));
+
+  const campaign = playable[0];
+  const creative = byCampaign.get(String(campaign._id));
+  const render = soundOf(campaign);
+  const brand = brands.get(campaign.advertiserRef);
+  const seconds = Math.ceil(Number(render.durationSeconds) || 0);
+
+  const publicBase = publicBaseOf(req);
+  const sid = crypto.randomBytes(16).toString('hex');
+  await db.collection(SESSIONS).insertOne({
+    sid,
+    surface: 'audio',
+    adFirstFetchAt: null,
+    // No roll and no banner: every reader already copes with both being absent.
+    campaignId: null,
+    creativeId: null,
+    adManifestUrl: null,
+    contentManifestUrl: null,
+    slotPercent: null,
+    slotPosition: null,
+    banner: null,
+    // `seconds` is the length of the SPEECH, not the booking: the impression claim
+    // is timed against what the listener actually has to sit through.
+    ticker: {
+      campaignId: campaign._id,
+      creativeId: creative._id,
+      slotPercent: campaign.slotPercent ?? null,
+      seconds,
+      clickUrl: creative.clickUrl || null,
+      tts: render.hash,
+    },
+    owner,
+    // The Hive post, which is what payout resolves the community from.
+    permlink: track.post_permlink || permlink,
+    audioPermlink: permlink,
+    viewer,
+    capId,
+    country,
+    clickUrl: null,
+    startedAt: new Date(),
+    app,
+    expiresAt: new Date(Date.now() + AD_SESSION_TTL_MINUTES * 60 * 1000),
+  });
+
+  res.set('Cache-Control', 'no-store');
+  return res.json({
+    ad: null,
+    audioAd: {
+      audioUrl: `${publicBase}/m/tts/${render.file}`,
+      durationSeconds: Number(render.durationSeconds) || seconds,
+      positionPercent: campaign.slotPercent ?? 0,
+      // Shown in the player while it plays: the spoken words, written down. An audio
+      // spot has none; the player then shows the advertiser and the link only.
+      message: creative.message || '',
+      // No text (an audio spot): the advertiser line holds still rather than crawling.
+      style: creative.style === 'hold' || !creative.message ? 'hold' : 'crawl',
+      account: (brand && brand.hiveAccount) || null,
+      productName: (brand && brand.projectName) || campaign.projectName || null,
+      clickUrl: creative.clickUrl ? `${publicBase}/m/${sid}/tc` : null,
+      shownUrl: `${publicBase}/m/${sid}/ticker-shown`,
+      adKey: adKeyOf(campaign._id),
+      capMinutes: AD_TICKER_FREQUENCY_CAP_MINUTES,
+      label: AD_BANNER_LABEL || 'Ad',
+    },
+    reason: null,
+  });
+}
+
 /* ─── POST /m/session ─────────────────────────────────────────────────── */
 router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
   try {
@@ -988,7 +1165,8 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
     const wantsPreroll = b.preroll === true || String(b.preroll) === 'true';
     const rawSurface = str(b.surface, 16);
     const surface = rawSurface === 'shorts' ? 'shorts'
-      : (rawSurface === 'upload' ? 'upload' : (rawSurface === 'live' ? 'live' : 'watch'));
+      : (rawSurface === 'upload' ? 'upload' : (rawSurface === 'live' ? 'live'
+        : (rawSurface === 'audio' ? 'audio' : 'watch')));
     /* ── LIVE STREAMS ──────────────────────────────────────────────────────────
      * `owner` is the host, `permlink` the room name (also the permlink of the
      * stream's Hive post when it was announced). It runs the WATCH surface's rules
@@ -1036,7 +1214,7 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
      * the key is parked under that sid and only becomes a "seen" once the ad is
      * actually delivered (repeatPlayed, from recordDelivery). Wrapping res.json
      * covers every one of the many return paths below without touching them. */
-    if (surface !== 'upload') {
+    if (surface !== 'upload' && !ipCapExempt(owner)) {
       const repeatKey = repeatKeyOf(callerIp(req), owner, permlink);
       if (await seenRepeat(repeatKey)) return res.json({ ad: null, reason: 'repeat_viewer' });
       if (await isOwnerConnection(callerIp(req), owner)) return res.json({ ad: null, reason: 'own_video' });
@@ -1193,8 +1371,11 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
     }
 
 
-    // Premium viewers and opted-out creators, decided in one place.
-    const decision = await adDecision({ viewer, owner, permlink });
+    // Premium viewers and opted-out creators, decided in one place. Audio has its
+    // own creator settings ("Ads on your audio" and the uploader's per-track switch).
+    const decision = surface === 'audio'
+      ? await audioAdDecision({ viewer, owner, permlink })
+      : await adDecision({ viewer, owner, permlink });
     if (!decision.ads) {
       // `premium` is echoed so the player can flag the watch session accordingly.
       // The inventory forecast excludes premium sessions, and it can only do that
@@ -1340,6 +1521,11 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
       return res.json({ ad: null, reason: 'cooldown', cooldownMinutes: AD_COOLDOWN_MINUTES });
     }
 
+    // The audio player's spoken ticker. Its own branch: nothing to splice, no banner.
+    if (surface === 'audio') {
+      return await serveAudioSpot({ req, res, db, b, owner, permlink, viewer, capId, country, app, decision });
+    }
+
     // How long THIS video is, for campaigns that target video length. Looked up
     // rather than taken from the request: the client could otherwise claim any
     // duration and place itself inside a window the advertiser paid to exclude.
@@ -1428,6 +1614,8 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
       // A format only a page can draw goes only to a page that asked for it, and a
       // ticker only onto content its beta list allows.
       if (formatOf(c).overlayOnly && (!wantsTicker || !tickerAllowedOn(owner))) return false;
+      // The audio spot is only ever heard (serveAudioSpot), never on a video.
+      if (formatOf(c).surface === 'audio') return false;
       // Each format against its own window.
       const key = formatOf(c).key;
       const cap = key === 'video_ticker' ? recentTicker : (key === 'video_banner' ? recentBanner : recent);
@@ -1704,6 +1892,22 @@ router.post('/session', express.json({ limit: '8kb' }), async (req, res) => {
     console.error('[ad-serve] session failed:', err && err.message);
     res.status(500).json({ error: 'Could not open a session' });
   }
+});
+
+/* ─── GET /m/tts/<hash>.mp3 — a spoken ticker's sound ─────────────────── */
+// A static file named by the hash of its text, so it never changes: cached for good.
+// Fetching it records nothing (the impression is /ticker-shown), so a player may
+// preload it freely. ~10 s of 64 kbit/s mono, about 80 KB a play.
+// 🚨 Declared BEFORE /:sid/:n, which would otherwise take 'tts' as a session id.
+router.get('/tts/:file', servingVisible, (req, res) => {
+  const file = ttsFilePath(str(req.params.file, 64));
+  if (!file) return res.status(400).send('bad file');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.set('Access-Control-Allow-Origin', '*');
+  res.type('audio/mpeg');
+  return res.sendFile(file, (err) => {
+    if (err && !res.headersSent) res.status(err.statusCode === 404 || err.code === 'ENOENT' ? 404 : 500).send('not found');
+  });
 });
 
 /* ─── GET /m/:sid.m3u8 ────────────────────────────────────────────────── */
@@ -2350,6 +2554,8 @@ router.post('/:sid/ticker-shown', servingVisible, express.json({ limit: '1kb' })
         country: session.country || null,
         ticker: true,
         ...(session.surface === 'live' ? { live: true } : {}),
+        // Heard in the audio player rather than seen over a video.
+        ...(session.surface === 'audio' ? { audio: true } : {}),
       },
       completed: true,
     });

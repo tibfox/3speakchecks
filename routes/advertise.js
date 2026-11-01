@@ -47,6 +47,8 @@ const {
 } = require('../utils/adFormats');
 const adSettings = require('../utils/adSettings');
 const { syncVideoAdFlagFromChain } = require('../utils/videoAdOptOut');
+const { syncAudioAdChoiceFromChain } = require('../utils/audioAdChoice');
+const { audioEnabledOf } = require('../utils/adEligibility');
 const {
   ADVERTISERS_COLLECTION,
   AD_CREATOR_PREFS_COLLECTION,
@@ -287,12 +289,18 @@ const mineVouchMessage = (hiveAccount, timestamp) => ['3speak-ads', 'mine-vouch'
 // that predates 'no-rolls' never sends rollsEnabled, so it still signs 'on'/'off'.
 // 🚨 The 3Speak API server builds this same message when it signs for a creator
 // (/api/ads/opt-out-signature): change both or neither.
-const prefsMode = (adsEnabled, rollsEnabled) => {
+// "Ads on your audio" rides the same slot as a suffix, '+audio' or '+no-audio', and
+// only when the client sent it (and ads are on). A client that predates audio
+// sends nothing, signs the plain mode, and leaves the stored audio choice alone.
+const prefsMode = (adsEnabled, rollsEnabled, audioEnabled) => {
   if (!adsEnabled) return 'off';
-  return rollsEnabled === false ? 'no-rolls' : 'on';
+  const base = rollsEnabled === false ? 'no-rolls' : 'on';
+  if (audioEnabled === true) return `${base}+audio`;
+  if (audioEnabled === false) return `${base}+no-audio`;
+  return base;
 };
-const prefsMessage = (hiveAccount, adsEnabled, communitySharePct, timestamp, rollsEnabled = true) =>
-  ['3speak-ads', 'creator-prefs', hiveAccount, prefsMode(adsEnabled, rollsEnabled),
+const prefsMessage = (hiveAccount, adsEnabled, communitySharePct, timestamp, rollsEnabled = true, audioEnabled) =>
+  ['3speak-ads', 'creator-prefs', hiveAccount, prefsMode(adsEnabled, rollsEnabled, audioEnabled),
     String(communitySharePct), String(timestamp)].join('|');
 
 /**
@@ -439,6 +447,21 @@ router.get('/inventory', featureVisible, async (req, res) => {
         // capacity as what their spot would reach during the trial.
         note: `These figures cover the whole of 3Speak. Ads are still in a closed trial and currently run only on ${ADS_ALLOWED_OWNERS.map((o) => `@${o}`).join(', ')}'s videos, so a booking made today would reach far less than the numbers below.`,
       } : { active: false, owners: [], note: null },
+      // The audio player's audience and the 3speak.tv uploads, for their own tabs.
+      // Null until the forecast has run with them.
+      audio: snap.audio ? {
+        measuredDays: snap.audio.measuredDays,
+        since: snap.audio.since,
+        listensPerDay: snap.audio.listensPerDay,
+        tracks: snap.audio.tracks,
+        listenHours: snap.audio.listenHours,
+        catalogue: snap.audio.catalogue,
+        trial: snap.audio.trial,
+        trialListensPerDay: snap.audio.trialListensPerDay,
+        slots: snap.audio.slots,
+        countries: snap.audio.countries,
+      } : null,
+      uploads: snap.uploads || null,
       // Stated openly on purpose. An advertiser who can see how much traffic we
       // threw away trusts the number that is left; one who only sees the headline
       // has no reason to.
@@ -923,6 +946,8 @@ router.get('/creator/prefs/:account', featureVisible, async (req, res) => {
       // so turning ads back on offers the last choice again.
       rollsEnabled,
       adMode: prefsMode(adsEnabled, rollsEnabled),
+      // "Ads on your audio" as it stands (an explicit choice, or what it follows).
+      audioEnabled: audioEnabledOf(doc),
       split: splitOf(doc),
       updatedAt: (doc && doc.updatedAt) || null,
     });
@@ -940,6 +965,8 @@ router.post('/creator/prefs', featureVisible, express.json({ limit: '8kb' }), as
     const adsEnabled = b.adsEnabled !== false;
     // Only meaningful with ads on; an 'off' signature says nothing about rolls.
     const rollsEnabled = !adsEnabled || b.rollsEnabled !== false;
+    // Only when sent, and only with ads on: then it is part of the signed message.
+    const audioEnabled = adsEnabled && typeof b.audioEnabled === 'boolean' ? b.audioEnabled : undefined;
     if (!HIVE_ACCOUNT_RE.test(name)) {
       return res.status(400).json({ success: false, error: 'Invalid account' });
     }
@@ -977,7 +1004,7 @@ router.post('/creator/prefs', featureVisible, express.json({ limit: '8kb' }), as
         return res.status(401).json({
           success: false,
           error: 'Signature required',
-          expected_message: prefsMessage(name, adsEnabled, communitySharePct, '<ms>', rollsEnabled),
+          expected_message: prefsMessage(name, adsEnabled, communitySharePct, '<ms>', rollsEnabled, audioEnabled),
         });
       }
       const tsErr = badTimestamp(timestamp);
@@ -985,7 +1012,7 @@ router.post('/creator/prefs', featureVisible, express.json({ limit: '8kb' }), as
       let verdict = { ok: false, signer: null };
       try {
         verdict = await verifyHiveAuthority({
-          message: prefsMessage(name, adsEnabled, communitySharePct, timestamp, rollsEnabled),
+          message: prefsMessage(name, adsEnabled, communitySharePct, timestamp, rollsEnabled, audioEnabled),
           signature,
           username: name,
           allowedDelegates: AD_SIGNING_DELEGATES,
@@ -1007,17 +1034,26 @@ router.post('/creator/prefs', featureVisible, express.json({ limit: '8kb' }), as
         // "the account holder set this themselves" are different facts, and the
         // day someone disputes an ad running on their video is the day we need it.
         // rollsEnabled only when ads are on: that is the only time it was signed.
-        $set: { adsEnabled, ...(adsEnabled ? { rollsEnabled } : {}), communitySharePct, signedBy, updatedAt: new Date() },
+        $set: {
+          adsEnabled, ...(adsEnabled ? { rollsEnabled } : {}),
+          ...(audioEnabled !== undefined ? { audioEnabled } : {}),
+          communitySharePct, signedBy, updatedAt: new Date(),
+        },
         $setOnInsert: { createdAt: new Date() },
       },
       { upsert: true },
     );
+    // Read back for the audio answer: an older client did not send it, so it is
+    // whatever was stored before (or what it follows).
+    const saved = await getDb().collection(AD_CREATOR_PREFS_COLLECTION)
+      .findOne({ _id: name }, { projection: { adsEnabled: 1, rollsEnabled: 1, audioEnabled: 1 } });
     res.json({
       success: true,
       account: name,
       adsEnabled,
       rollsEnabled,
       adMode: prefsMode(adsEnabled, rollsEnabled),
+      audioEnabled: audioEnabledOf(saved),
       signedBy,
       // Returned as the full split rather than one number, so nothing downstream
       // has to remember which side of the pool the stored figure refers to.
@@ -1052,6 +1088,31 @@ function syncThrottled(ip) {
   }
   return false;
 }
+
+/* ─── per-audio choice (the uploader's "Ads on this audio") ────────────────
+ * Same contract as the per-video route above: unauthenticated, nothing in the
+ * request believed, the choice copied off the chain. See utils/audioAdChoice.js.
+ * 404 until the post is readable AND linked to its audio; the uploader retries. */
+router.post('/creator/audio-ads/sync', featureVisible, express.json({ limit: '2kb' }), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const author = account(b.author);
+    const permlink = str(b.permlink, 256);
+    if (!HIVE_ACCOUNT_RE.test(author) || !/^[a-z0-9-]+$/.test(permlink)) {
+      return res.status(400).json({ success: false, error: 'Invalid author/permlink' });
+    }
+    if (syncThrottled(clientIp(req))) {
+      return res.status(429).json({ success: false, error: 'Too many requests' });
+    }
+    const out = await syncAudioAdChoiceFromChain(author, permlink);
+    if (out === null) return res.status(502).json({ success: false, error: 'Hive unreachable' });
+    if (out.notFound) return res.status(404).json({ success: false, error: 'Post or audio not found' });
+    res.json({ success: true, owner: out.owner, permlink: out.permlink, audioAds: out.audioAds });
+  } catch (err) {
+    console.error('[advertise] audio ads sync failed:', err && err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
 
 router.post('/creator/video-ads/sync', featureVisible, express.json({ limit: '2kb' }), async (req, res) => {
   try {
@@ -1411,7 +1472,9 @@ router.post('/admin/creatives/:id/decide', requireAdmin, express.json({ limit: '
             ? 'That banner has no image on record — nothing to show.'
             : missing === 'creative_has_no_message'
               ? 'That ticker has no message or link on record — nothing to show.'
-              : 'That spot has not finished encoding yet — there is nothing to play.',
+              : missing === 'creative_has_no_audio'
+                ? 'That audio spot has no file on record, nothing to play.'
+                : 'That spot has not finished encoding yet — there is nothing to play.',
         });
       }
     }
