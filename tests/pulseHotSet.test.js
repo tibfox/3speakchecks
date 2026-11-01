@@ -22,16 +22,16 @@ function fakeDb(collections, aggregateRows = []) {
   return {
     calls,
     collection: (name) => ({
-      find: (query) => ({
+      find: (query, options) => ({
         toArray: async () => {
-          calls.push({ name, op: 'find', n: query.$or.length });
+          calls.push({ name, op: 'find', n: query.$or.length, maxTimeMS: options.maxTimeMS });
           const wanted = new Set(query.$or.map((c) => `${c.owner}/${c.permlink}`));
           return (collections[name] || []).filter((d) => wanted.has(`${d.owner}/${d.permlink}`));
         },
       }),
-      aggregate: (pipeline) => ({
+      aggregate: (pipeline, options) => ({
         toArray: async () => {
-          calls.push({ name, op: 'aggregate', pipeline });
+          calls.push({ name, op: 'aggregate', pipeline, options });
           return aggregateRows;
         },
       }),
@@ -60,7 +60,7 @@ describe('resolveHotSet', () => {
       { collection: 'videos', owner: 'tovia01', permlink: 'lkgdgnazjd', sessions: 9, lastWatchedAt: NOW },
     ]);
     // Legacy is only asked about what the embed lookup didn't resolve.
-    expect(db.calls.filter((c) => c.name === 'videos')).toEqual([{ name: 'videos', op: 'find', n: 1 }]);
+    expect(db.calls.filter((c) => c.name === 'videos').map((c) => c.n)).toEqual([1]);
   });
 
   test('falls back to legacy when the embed is not published', async () => {
@@ -156,6 +156,9 @@ describe('buildHotSet', () => {
     // Same counting key as retentionWorker.js: viewerId → ip → sid.
     expect(group.$group.keys).toEqual({ $addToSet: { $ifNull: ['$viewerId', { $ifNull: ['$ip', '$sid'] }] } });
     expect(threshold).toEqual({ $match: { sessions: { $gte: 5 } } });
+    // A server-side cap on every query, so a stuck one can't hold the build forever.
+    expect(agg.options.maxTimeMS).toBeGreaterThan(0);
+    expect(db.calls.filter((c) => c.op === 'find').every((c) => c.maxTimeMS > 0)).toBe(true);
 
     expect(body).toEqual({
       generatedAt: NOW.toISOString(), windowHours: 48, minSessions: 5, count: 1,
@@ -236,6 +239,41 @@ describe('GET /pulse/hot-set', () => {
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.body).toEqual(full);
+  });
+});
+
+describe('PULSE_HOTSET_* numbers', () => {
+  const load = (env) => {
+    const saved = { ...process.env };
+    Object.assign(process.env, env);
+    let cfg;
+    jest.isolateModules(() => { cfg = require('../utils/config'); });
+    process.env = saved;
+    return cfg;
+  };
+
+  test('keep a configured 0 where it means something', () => {
+    expect(load({ PULSE_HOTSET_MIN_AGE_DAYS: '0' }).PULSE_HOTSET_MIN_AGE_DAYS).toBe(0);
+  });
+
+  test('fall back on negative, zero-where-meaningless, non-integer or junk values', () => {
+    const cfg = load({
+      PULSE_HOTSET_LIMIT: '-5',
+      PULSE_HOTSET_MIN_SESSIONS: '0',
+      PULSE_HOTSET_WINDOW_HOURS: '1.5',
+      PULSE_HOTSET_INTERVAL_MIN: 'soon',
+      PULSE_HOTSET_MIN_AGE_DAYS: '-1',
+    });
+    expect(cfg).toMatchObject({
+      PULSE_HOTSET_LIMIT: 500, PULSE_HOTSET_MIN_SESSIONS: 5, PULSE_HOTSET_WINDOW_HOURS: 48,
+      PULSE_HOTSET_INTERVAL_MIN: 30, PULSE_HOTSET_MIN_AGE_DAYS: 30,
+    });
+  });
+
+  test('take valid values as given', () => {
+    expect(load({ PULSE_HOTSET_LIMIT: '50', PULSE_HOTSET_WINDOW_HOURS: '24' })).toMatchObject({
+      PULSE_HOTSET_LIMIT: 50, PULSE_HOTSET_WINDOW_HOURS: 24,
+    });
   });
 });
 

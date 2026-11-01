@@ -55,15 +55,22 @@ function watchedPipeline({ cutoff, minSessions }) {
   ];
 }
 
+// Server-side cap on every query in a build. Without it a query Mongo keeps
+// running holds `running` true, every later tick skips, and the list goes stale
+// (or stays cold) for as long as it runs.
+const QUERY_MAX_TIME_MS = 5 * 60 * 1000;
+
 async function aggregateWatched(db, opts) {
-  return db.collection(WATCH_LOG).aggregate(watchedPipeline(opts), { allowDiskUse: true }).toArray();
+  return db.collection(WATCH_LOG)
+    .aggregate(watchedPipeline(opts), { allowDiskUse: true, maxTimeMS: QUERY_MAX_TIME_MS })
+    .toArray();
 }
 
 /** $or lookups in chunks, like services/discoverWorker.js. */
 async function findChunked(coll, conds, projection, size = 200) {
   const out = [];
   for (let i = 0; i < conds.length; i += size) {
-    out.push(...await coll.find({ $or: conds.slice(i, i + size) }, { projection }).toArray());
+    out.push(...await coll.find({ $or: conds.slice(i, i + size) }, { projection, maxTimeMS: QUERY_MAX_TIME_MS }).toArray());
   }
   return out;
 }
